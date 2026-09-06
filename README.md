@@ -103,6 +103,32 @@ DENY  shared/dashboard.html
        owner cwd: /tree/shared
 ```
 
+### Binding adopted sessions
+
+A session that registers from the inside knows its own conversation id. One
+*adopted* from the outside does not, and cannot be made to — a running agent
+keeps no descriptor on its transcript and does not carry the id in its own
+environment (verified by reading /proc, not assumed). Without that id a restore
+can only resume by directory, which silently picks the wrong conversation.
+
+```bash
+./scoot-rim-agentd suggest-bindings            # propose, with evidence; writes nothing
+./scoot-rim-agentd suggest-bindings --apply    # record the high-confidence ones
+```
+
+Evidence, not guesswork — each candidate carries the signals that fired
+(`dir-match`, `active`, `sole-transcript`, `newest`, `cwd-recorded`,
+`sibling-dir`), and `--apply` records only `high` unless
+`--include-uncertain` is passed. Applied bindings carry `origin=inferred` plus
+their confidence, so a guess stays distinguishable from a real registration
+forever after. A conversation is never offered to two sessions: matches are
+assigned strongest-first and the weaker claimant is reported unresolved rather
+than handed a plausible wrong answer.
+
+The hard case is a renamed directory, and it breaks both ways: the conversation
+stays filed under the old name while every `/proc` cwd link reports the new one.
+`sibling-dir` reaches it through the untouched parent path, capped at `medium`.
+
 ### Read-only HTTP view (tablet client)
 
 ```bash
@@ -154,7 +180,8 @@ changes.
 ## Status
 
 Early. What works: the event log, the fold, ownership resolution, the
-query CLI, and the read-only HTTP view with its browser client — 30 tests.
+query CLI, binding inference for adopted sessions, and the read-only HTTP view
+with its browser client — 41 tests.
 
 Not built yet: the supervising daemon proper. Nothing in this package schedules
 work or acts on its own — timer-driven reconciliation and the pre-write gate are

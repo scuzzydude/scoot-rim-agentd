@@ -316,3 +316,100 @@ class TestApiSnapshot(unittest.TestCase):
                                   cwd=str(self.root / "vanished"))
         snap = self._snap()
         self.assertEqual(snap["counts"]["unrestorable"], 1)
+
+
+class TestBinding(unittest.TestCase):
+    """Inferring which conversation belongs to which adopted session.
+
+    The cases here are the ones seen live, not invented: a clean match, a
+    directory with several conversations, a renamed leaf, and two sessions
+    competing for one conversation.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.projects = Path(self.dir.name) / "projects"
+        self.projects.mkdir()
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _mk(self, cwd, session_id, age_s=60, cwds=()):
+        from rimagentd.binding import encode_cwd
+        d = self.projects / encode_cwd(cwd)
+        d.mkdir(exist_ok=True)
+        f = d / f"{session_id}.jsonl"
+        f.write_text("".join(
+            '{"sessionId":"%s","cwd":"%s"}\n' % (session_id, c) for c in cwds
+        ) or '{"sessionId":"%s"}\n' % session_id)
+        t = __import__("time").time() - age_s
+        os.utime(f, (t, t))
+        return f
+
+    def _sessions(self, *pairs):
+        from rimagentd.fold import Session
+        return [Session(backend_id=f"{i+1}.{n}", name=n, cwd=c)
+                for i, (n, c) in enumerate(pairs)]
+
+    def test_sole_active_transcript_is_high_confidence(self):
+        from rimagentd.binding import suggest
+        self._mk("/t/a", "sid-a", cwds=("/t/a",))
+        res = suggest(self._sessions(("a", "/t/a")), self.projects)
+        chosen = res["1.a"]["chosen"]
+        self.assertEqual(chosen.session_id, "sid-a")
+        self.assertEqual(chosen.confidence, "high")
+
+    def test_stale_transcript_is_not_high_confidence(self):
+        """A conversation nobody has written to in hours probably is not the one
+        a running session is using."""
+        from rimagentd.binding import suggest
+        self._mk("/t/a", "sid-old", age_s=60 * 60 * 24, cwds=("/t/a",))
+        res = suggest(self._sessions(("a", "/t/a")), self.projects)
+        self.assertNotEqual(res["1.a"]["chosen"].confidence, "high")
+
+    def test_newest_wins_when_a_directory_has_several(self):
+        from rimagentd.binding import suggest
+        self._mk("/t/a", "sid-old", age_s=600, cwds=("/t/a",))
+        self._mk("/t/a", "sid-new", age_s=30, cwds=("/t/a",))
+        self.assertEqual(suggest(self._sessions(("a", "/t/a")), self.projects)["1.a"]
+                         ["chosen"].session_id, "sid-new")
+
+    def test_renamed_leaf_is_found_via_the_parent_but_only_at_medium(self):
+        """The case no cwd derivation reaches: the conversation is filed under
+        the OLD leaf name and nothing on the host remembers it. The parent path
+        is intact, so it is still positional evidence — but weaker, so it must
+        not be reported as high."""
+        from rimagentd.binding import suggest
+        self._mk("/srv/deep/tree/here/oldname", "sid-renamed", cwds=("/x",))
+        res = suggest(self._sessions(("s", "/srv/deep/tree/here/newname")), self.projects)
+        chosen = res["1.s"]["chosen"]
+        self.assertEqual(chosen.session_id, "sid-renamed")
+        self.assertEqual(chosen.confidence, "medium")
+
+    def test_shallow_parent_does_not_match_the_whole_tree(self):
+        """Guard on the fallback: a shallow parent would match nearly every
+        directory, so it must not be used at all."""
+        from rimagentd.binding import suggest
+        self._mk("/a/b", "sid-x")
+        res = suggest(self._sessions(("s", "/a/zz")), self.projects)
+        self.assertIsNone(res["1.s"]["chosen"])
+
+    def test_one_conversation_is_never_offered_to_two_sessions(self):
+        from rimagentd.binding import suggest
+        self._mk("/srv/deep/tree/here/only", "sid-one", cwds=("/srv/deep/tree/here/only",))
+        res = suggest(self._sessions(("owner", "/srv/deep/tree/here/only"),
+                                     ("other", "/srv/deep/tree/here/gone")), self.projects)
+        # The session whose own directory it is has the stronger evidence and
+        # takes it; the other must be left unresolved, not given a wrong answer.
+        self.assertEqual(res["1.owner"]["chosen"].session_id, "sid-one")
+        self.assertIsNone(res["2.other"]["chosen"])
+
+    def test_already_bound_sessions_are_left_alone(self):
+        from rimagentd.binding import suggest
+        from rimagentd.fold import Session
+        s = Session(backend_id="1.a", name="a", cwd="/t/a", agent_session_id="already")
+        self.assertEqual(suggest([s], self.projects), {})
+
+    def test_underscore_and_slash_both_collapse_in_the_directory_name(self):
+        from rimagentd.binding import encode_cwd
+        self.assertEqual(encode_cwd("/a/b_c/d"), "-a-b-c-d")

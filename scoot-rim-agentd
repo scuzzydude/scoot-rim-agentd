@@ -445,6 +445,70 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_suggest_bindings(args) -> int:
+    """Propose an agent conversation for each unbound session, with evidence.
+
+    Prints by default and writes only with --apply, because a wrong binding is
+    worse than none: `restore` would resume the wrong conversation silently,
+    whereas an absent binding makes it refuse and say why. Applied bindings are
+    recorded with origin=inferred and their confidence, so the guess stays
+    distinguishable from a session's own registration forever after.
+    """
+    from rimagentd.binding import suggest
+
+    state = _state(args)
+    unbound = [s for s in state.sessions_sorted() if not s.bound]
+    if not unbound:
+        print("every live session is already bound")
+        return 0
+
+    results = suggest(unbound)
+    log = _log(args)
+    applied = skipped = 0
+    for s in unbound:
+        res = results.get(s.backend_id, {})
+        chosen = res.get("chosen")
+        if chosen is None:
+            n = len(res.get("candidates", []))
+            why = "no project directory found for its cwd" if n == 0 else \
+                  "every candidate is claimed by a session with better evidence"
+            print(f"UNRESOLVED  {s.name}\n            {why}")
+            skipped += 1
+            continue
+
+        conf = chosen.confidence
+        print(f"{conf.upper():<10}  {s.name} -> {chosen.session_id}")
+        print(f"            evidence: {', '.join(chosen.signals)}")
+        if len(res["candidates"]) > 1:
+            others = [c.session_id[:8] for c in res["candidates"][1:4]]
+            print(f"            also possible: {', '.join(others)}")
+
+        if not args.apply:
+            continue
+        if conf != "high" and not args.include_uncertain:
+            print("            NOT applied — below high confidence"
+                  " (use --include-uncertain to accept it)")
+            skipped += 1
+            continue
+        log.append(
+            "agent_bound",
+            backend_id=s.backend_id,
+            agent_session_id=chosen.session_id,
+            cwd=s.cwd,
+            origin="inferred",
+            confidence=conf,
+            evidence=",".join(chosen.signals),
+        )
+        print("            applied")
+        applied += 1
+
+    if args.apply:
+        print(f"\n{applied} bound, {skipped} left unbound")
+    else:
+        print("\n(nothing written — pass --apply to record these)")
+    return 0
+
+
 def cmd_event(args) -> int:
     if len(args.kv) % 2 != 0:
         print("scoot-rim-agentd: event fields must be key/value pairs", file=sys.stderr)
@@ -524,6 +588,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--token", default="",
                    help="require this bearer token; '-' generates one and prints it")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("suggest-bindings",
+                       help="propose an agent conversation for each unbound session")
+    p.add_argument("--apply", action="store_true",
+                   help="record the high-confidence matches as agent_bound events")
+    p.add_argument("--include-uncertain", action="store_true",
+                   help="with --apply, also record medium/low matches (may bind the WRONG conversation)")
+    p.set_defaults(func=cmd_suggest_bindings)
 
     p = sub.add_parser("event", help="append an event")
     p.add_argument("type")
