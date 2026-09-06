@@ -156,11 +156,15 @@ changes.
 Early. What works: the event log, the fold, ownership resolution, the
 query CLI, and the read-only HTTP view with its browser client — 30 tests.
 
-Not built yet: the daemon itself (service + timer reconciliation), the pre-write
-gate that would call `check`, an HTTP API, and clients. `restore-plan` prints
-commands and deliberately does not run them — acting belongs in the daemon,
-where it can be gated and logged as an action rather than triggered by accident
-from a shell.
+Not built yet: the supervising daemon proper. Nothing in this package schedules
+work or acts on its own — timer-driven reconciliation and the pre-write gate are
+site config (a systemd timer calling `reconcile`, a hook calling `check`) rather
+than code here.
+
+`restore-plan` prints commands and deliberately does not run them, and `serve`
+exposes no way to trigger anything. Acting belongs where it can be gated and
+logged as an action, not somewhere it can be reached by accident from a shell or
+a mis-tap.
 
 ```bash
 python3 -m unittest discover -s tests

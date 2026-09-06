@@ -1,0 +1,46 @@
+# Read-only HTTP view of the session log, for a browser client (e.g. a tablet).
+#
+# Install: copy to /etc/systemd/system/, edit User= and the paths, then
+#   systemctl enable --now scoot-rim-serve
+#
+# BEFORE YOU CHANGE --bind: the default binds loopback only, which means this
+# unit alone does not make anything reachable from another device. Exposing it
+# is a separate, deliberate decision — and on a restricted network it is a
+# policy question (tunnel? VPN? firewall rule?) before it is a config one. An
+# SSH tunnel is the option that needs no exposure at all:
+#
+#   ssh -N -L 4300:127.0.0.1:4300 user@host      # then open localhost:4300
+#
+# If you do widen the bind, set a token as well — but read the note in
+# rimagentd/api.py first: the token is a speed bump on a read-only view of
+# session names and directories, not authentication, and it does not make a
+# wide bind safe.
+#
+# The endpoint cannot restore, kill or modify anything; that is enforced in the
+# API, not by this unit. So the blast radius of getting the bind wrong is
+# disclosure of session names and directory paths — which may still be more
+# than you want.
+
+[Unit]
+Description=scoot-rim-agentd read-only session view
+After=network.target
+
+[Service]
+Type=simple
+User=CHANGEME
+Environment="SCOOT_RIM_OWNERSHIP=/path/to/ownership.toml"
+ExecStart=/path/to/scoot-rim-agentd/scoot-rim-agentd serve --bind 127.0.0.1 --port 4300
+Restart=on-failure
+RestartSec=5
+
+# The view is a pure read of the log and the ownership map. Nothing here needs
+# to write, own a device, or gain privilege.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+PrivateDevices=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=default.target

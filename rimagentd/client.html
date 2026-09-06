@@ -77,6 +77,7 @@
   }
   li .why { color: var(--dim); font-size: 13px; }
   .empty { color: var(--dim); font-size: 13px; }
+  .legend { color: var(--dim); font-size: 12px; white-space: normal; }
 </style>
 
 <header>
@@ -102,6 +103,7 @@ function renderCounts(c) {
   const cards = [
     ["live", c.live, ""],
     ["unbound", c.unbound, c.unbound ? "warn" : ""],
+    ["cwd gone", c.unrestorable, c.unrestorable ? "bad" : ""],
     ["deferred", c.deferred, c.deferred ? "warn" : ""],
     ["escalated", c.escalated, c.escalated ? "bad" : ""],
     ["exited", c.exited, ""],
@@ -110,23 +112,45 @@ function renderCounts(c) {
     `<div class="count ${cls}"><b>${n}</b><span>${label}</span></div>`).join("");
 }
 
+function row(s, depth) {
+  const pad = "  ".repeat(depth);
+  // The asterisk means the governing node claims only named paths, so this
+  // session's own directory is not itself governed by that policy. Showing a
+  // bare policy would overstate it.
+  const pol = s.policy
+    ? `<span class="pol ${esc(s.policy)}">(${esc(s.policy)}${s.policy_partial ? "*" : ""})</span>` : "";
+  const tags = (s.bound ? "" : '<span class="tag unbound">UNBOUND</span>') +
+               (s.restorable ? "" : '<span class="tag gone">CWD GONE</span>');
+  return `<div class="sess">${pad}<span class="name">* ${esc(s.name)}</span>${pol}${tags}</div>`;
+}
+
 function renderTree(root, sessions) {
   if (!sessions.length) { $("tree").innerHTML = '<div class="empty">no live sessions</div>'; return; }
-  // Same shared-parent collapsing as the CLI's tree, so the two views agree.
-  const rows = sessions.slice().sort((a, b) => (a.rel || "").localeCompare(b.rel || ""));
-  let out = "", prev = [];
-  for (const s of rows) {
+  // Sessions outside the managed tree have no relative path. Splitting their
+  // absolute path here would invent a branch off the root, so they are listed
+  // separately -- same treatment as the CLI, so the two views agree.
+  const inside = sessions.filter(s => s.in_root)
+                         .sort((a, b) => (a.rel || "").localeCompare(b.rel || ""));
+  const outside = sessions.filter(s => !s.in_root)
+                          .sort((a, b) => (a.cwd || "").localeCompare(b.cwd || ""));
+  let out = "", prev = [], partial = false;
+  for (const s of inside) {
     const parts = (!s.rel || s.rel === ".") ? [] : s.rel.split("/");
     let common = 0;
     while (common < parts.length && common < prev.length && parts[common] === prev[common]) common++;
     for (let d = common; d < parts.length; d++)
       out += `<div class="dir">${"  ".repeat(d + 1)}${esc(parts[d])}/</div>`;
     prev = parts;
-    const pad = "  ".repeat(parts.length + 1);
-    const pol = s.policy ? `<span class="pol ${esc(s.policy)}">(${esc(s.policy)})</span>` : "";
-    const tags = (s.bound ? "" : '<span class="tag unbound">UNBOUND</span>') +
-                 (s.restorable ? "" : '<span class="tag gone">CWD GONE</span>');
-    out += `<div class="sess">${pad}<span class="name">* ${esc(s.name)}</span>${pol}${tags}</div>`;
+    out += row(s, parts.length + 1);
+    if (s.policy_partial) partial = true;
+  }
+  if (outside.length) {
+    out += `<div class="dir">&nbsp;</div><div class="dir">(outside ${esc(root) || "any managed tree"})</div>`;
+    for (const s of outside) out += row(s, 1) + `<div class="dir">    ${esc(s.cwd || "<no cwd>")}</div>`;
+  }
+  if (partial) {
+    out += '<div class="dir">&nbsp;</div><div class="legend">* the governing node claims only ' +
+           'named paths — this session&rsquo;s own directory is not governed by that policy</div>';
   }
   $("tree").innerHTML = out;
 }

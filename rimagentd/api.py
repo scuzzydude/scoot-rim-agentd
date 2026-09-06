@@ -60,23 +60,32 @@ def snapshot(log_path=None, ownership_path=None) -> dict:
 
     sessions = []
     for s in state.sessions_sorted():
-        policy = ""
-        rel = s.cwd
+        policy, partial, rel = "", False, None
         if own is not None and s.cwd:
-            node = own.governing_node(s.cwd)
-            if node is not None:
-                policy = node.policy
             r = own.relative(s.cwd)
             if r is not None:
                 rel = "." if r == "." else r
+                node = own.governing_node(s.cwd)
+                if node is not None:
+                    policy = node.policy
+                    # A node with `owns` claims only those globs, so its policy
+                    # does not govern this session's own directory. Reporting a
+                    # bare policy would overstate it, and the client shows the
+                    # distinction rather than flattening it.
+                    partial = bool(node.owns) and own.owner_of(s.cwd) is None
         sessions.append({
             "name": s.name,
             "backend_id": s.backend_id,
             "cwd": s.cwd,
+            # None when the session sits outside the managed tree. The client
+            # must not split an absolute path as if it were relative -- that
+            # invented a bogus branch off the root in an earlier version.
             "rel": rel,
+            "in_root": rel is not None,
             "bound": s.bound,
             "agent_session_id": s.agent_session_id,
             "policy": policy,
+            "policy_partial": partial,
             "restorable": bool(s.cwd) and Path(s.cwd).is_dir(),
         })
 
@@ -102,6 +111,7 @@ def snapshot(log_path=None, ownership_path=None) -> dict:
             "live": len(state.live),
             "exited": len(state.exited),
             "unbound": sum(1 for s in state.live.values() if not s.bound),
+            "unrestorable": sum(1 for s in sessions if not s["restorable"]),
             "deferred": len(state.deferred),
             "escalated": len(state.escalated),
         },

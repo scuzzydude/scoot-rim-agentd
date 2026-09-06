@@ -67,34 +67,49 @@ def cmd_tree(args) -> int:
         return 0
 
     root = ""
-    policies: dict[str, str] = {}
+    own = None
     try:
         own = Ownership.load(args.ownership)
         root = own.root
-        for session in state.live.values():
-            if not session.cwd:
-                continue
-            # governing_node(), not owner_of(): the tree is keyed on POSITION,
-            # and owner_of() honours `owns`, so a node claiming only specific
-            # globs would report no policy for its own directory.
-            node = own.governing_node(session.cwd)
-            if node is not None:
-                policies[session.backend_id] = node.policy
     except OwnershipError:
         pass  # no map configured — still worth showing the tree
 
-    # Group by path relative to root, so the tree mirrors the directory shape.
-    rows: list[tuple[str, object]] = []
+    inside: list[tuple[str, object, str]] = []
+    outside: list[object] = []
+    partial = False
     for session in state.sessions_sorted():
-        rel = session.cwd
-        if root and session.cwd.startswith(root):
-            rel = session.cwd[len(root):].strip("/") or "."
-        rows.append((rel, session))
-    rows.sort(key=lambda r: r[0])
+        rel = own.relative(session.cwd) if (own and session.cwd) else None
+        if rel is None:
+            # Outside the managed tree (or no map at all). Splitting an absolute
+            # path here would invent a bogus branch off the root — an earlier
+            # version rendered "/ → home/ → steve/" under /srv/steveai — so these
+            # get listed separately and honestly instead.
+            outside.append(session)
+            continue
+        label = ""
+        node = own.governing_node(session.cwd)
+        if node is not None:
+            label = node.policy
+            # A node with `owns` claims only those globs, so its policy does NOT
+            # govern this session's own directory — saying a bare "(strict)" next
+            # to such a session overstates it. Mark it and explain once.
+            if node.owns and not own.owner_of(session.cwd):
+                label += "*"
+                partial = True
+        inside.append(("." if rel == "." else rel, session, label))
+    inside.sort(key=lambda r: r[0])
+
+    def _row(session, label, depth):
+        pad = "  " * depth
+        tags = "" if session.bound else "  [UNBOUND]"
+        if session.cwd and not Path(session.cwd).is_dir():
+            tags += "  [CWD GONE]"
+        pol = f"  ({label})" if label else ""
+        print(f"{pad}* {session.name}{pol}{tags}")
 
     print(root or "(no ownership root configured)")
     prev: list[str] = []
-    for i, (rel, session) in enumerate(rows):
+    for rel, session, label in inside:
         parts = [] if rel == "." else rel.split("/")
         # Print only the path segments that differ from the previous row, so
         # shared parents appear once instead of being repeated per session.
@@ -104,12 +119,17 @@ def cmd_tree(args) -> int:
         for depth in range(common, len(parts)):
             print(f"{'  ' * (depth + 1)}{parts[depth]}/")
         prev = parts
+        _row(session, label, len(parts) + 1)
 
-        indent = "  " * (len(parts) + 1)
-        mark = "" if session.bound else "  [UNBOUND]"
-        policy = policies.get(session.backend_id, "")
-        tag = f"  ({policy})" if policy else ""
-        print(f"{indent}* {session.name}{tag}{mark}")
+    if outside:
+        print(f"\n(outside {root})" if root else "\n(no ownership map — position unknown)")
+        for session in sorted(outside, key=lambda s: s.cwd or s.name):
+            _row(session, "", 1)
+            print(f"    {session.cwd or '<no cwd recorded>'}")
+
+    if partial:
+        print("\n* the governing node claims only named paths, so this session's own"
+              "\n  directory is not itself governed by that policy — use `check` for a file")
     return 0
 
 

@@ -291,3 +291,28 @@ class TestApiSnapshot(unittest.TestCase):
         # do_POST exists only to answer 405.
         import inspect
         self.assertIn("read-only", inspect.getsource(api._Handler.do_POST))
+
+    def test_session_outside_root_is_flagged_not_given_a_fake_path(self):
+        """Regression. `rel` used to fall back to the absolute path, which the
+        tree then split on "/" — inventing a bogus "/ → home → steve" branch
+        hanging off the root. Outside-the-tree must be reported as such."""
+        lg = EventLog(self.log)
+        lg.append("session_start", backend_id="9.out", name="elsewhere", cwd="/tmp")
+        by = {s["name"]: s for s in self._snap()["sessions"]}
+        self.assertFalse(by["elsewhere"]["in_root"])
+        self.assertIsNone(by["elsewhere"]["rel"])
+        self.assertTrue(by["alice"]["in_root"])
+
+    def test_policy_is_marked_partial_when_node_claims_only_named_paths(self):
+        """`shared` claims only dashboard.html, so a session sitting there is
+        NOT wholesale governed by handoff — reporting a bare policy overstates
+        it. components/* claims its subtree, so that one is not partial."""
+        by = {s["name"]: s for s in self._snap()["sessions"]}
+        self.assertTrue(by["dash"]["policy_partial"])
+        self.assertFalse(by["alice"]["policy_partial"])
+
+    def test_unrestorable_count_tracks_missing_cwds(self):
+        EventLog(self.log).append("session_start", backend_id="9.g", name="gone",
+                                  cwd=str(self.root / "vanished"))
+        snap = self._snap()
+        self.assertEqual(snap["counts"]["unrestorable"], 1)
