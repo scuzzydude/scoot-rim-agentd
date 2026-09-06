@@ -1,0 +1,30 @@
+# Example ownership map. Copy, edit, and point $SCOOT_RIM_OWNERSHIP at it.
+# This file is an EXAMPLE ONLY — a real map names real directories and belongs
+# outside this repo, so that the engine stays portable between hosts.
+#
+# Ownership is positional: the owner of a file is the session whose working
+# directory contains it. Never a session name — names change across restarts,
+# directories don't.
+
+root = "/path/to/the/tree/you/manage"
+
+# Most sessions just work in their own area. No coordination needed.
+[[node]]
+path   = "components/*"
+policy = "own-subtree"
+
+# A file many sessions need to change. One writer; everyone else hands off a
+# payload and keeps working, so nobody blocks.
+[[node]]
+path   = "shared"
+owns   = ["dashboard.html", "*.config.json"]
+policy = "handoff"
+note   = "contended: hand changes to the session working in shared/"
+
+# Deployed code and live services. A collision here costs more than
+# recoverable text, so the same mechanism runs at a stricter setting.
+[[node]]
+path   = "."
+owns   = ["deploy/*", "*.service"]
+policy = "strict"
+note   = "gate writes AND side effects (restarts), not just writes"

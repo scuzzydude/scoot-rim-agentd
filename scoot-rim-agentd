@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""scoot-rim-agentd — query the agent-session event log and ownership map.
+
+No daemon yet, on purpose: every command here is a pure read of the log plus
+(for `check`) the ownership map. That keeps the useful half available before any
+service exists, and means the eventual daemon adds scheduling and an API rather
+than logic.
+
+Environment:
+  SCOOT_RIM_EVENTS / SCOOT_RIM_HOME   where the event log lives
+  SCOOT_RIM_OWNERSHIP                 path to the ownership map (site config)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from rimagentd import EventLog, Ownership, OwnershipError, fold  # noqa: E402
+
+
+def _log(args) -> EventLog:
+    return EventLog(args.log)
+
+
+def _state(args):
+    return fold(_log(args).records())
+
+
+# -- commands ---------------------------------------------------------------
+
+def cmd_live(args) -> int:
+    state = _state(args)
+    if not state.live:
+        print("no live sessions in the log")
+        return 0
+    if args.json:
+        print(json.dumps([s.__dict__ for s in state.sessions_sorted()], indent=2))
+        return 0
+    width = max(len(s.name) for s in state.live.values()) if state.live else 4
+    for s in state.sessions_sorted():
+        print(f"{s.name:<{width}}  {s.backend_id:<28}  "
+              f"{'bound' if s.bound else 'UNBOUND':<8}  {s.cwd}")
+    return 0
+
+
+def cmd_open(args) -> int:
+    """Deferred and escalated items with no matching resume/decide.
+
+    These are the items most likely to be silently lost across a context
+    turnover or a reboot, which is the reason the log records them at all.
+    """
+    state = _state(args)
+    if not state.deferred and not state.escalated:
+        print("nothing deferred or escalated")
+        return 0
+    for item, rec in sorted(state.deferred.items()):
+        reason = rec.get("reason", "")
+        print(f"DEFERRED   {item}" + (f"  — {reason}" if reason else ""))
+    for question, rec in sorted(state.escalated.items()):
+        to = rec.get("to", "")
+        print(f"ESCALATED  {question}" + (f"  → {to}" if to else ""))
+    return 0
+
+
+def cmd_claims(args) -> int:
+    state = _state(args)
+    if not state.claims:
+        print("no outstanding claims")
+        return 0
+    for resource, holder in sorted(state.claims.items()):
+        session = state.live.get(holder)
+        print(f"{resource}  held by {session.name if session else holder}")
+    return 0
+
+
+def cmd_restore_plan(args) -> int:
+    """Print what a restore WOULD run. Never acts.
+
+    Acting belongs in the daemon, where it can be logged as an action and
+    gated — not in a CLI where it could be triggered by accident.
+    """
+    state = _state(args)
+    if not state.live:
+        print("# nothing to restore")
+        return 0
+    for s in state.sessions_sorted():
+        if not s.cwd:
+            print(f"# SKIP {s.name} — no cwd recorded")
+            continue
+        if not Path(s.cwd).is_dir():
+            print(f"# SKIP {s.name} — cwd no longer exists: {s.cwd}")
+            continue
+        if s.bound:
+            inner = f"claude --resume {s.agent_session_id}"
+        else:
+            print(f"# {s.name} — no agent_session_id; resume-by-directory is APPROXIMATE")
+            inner = "claude --continue"
+        print(
+            f"(cd {shlex.quote(s.cwd)} && screen -dmS {shlex.quote(s.name)} && "
+            f"screen -S {shlex.quote(s.name)} -X stuff {shlex.quote(inner + chr(13))})"
+        )
+    return 0
+
+
+def cmd_check(args) -> int:
+    """Would a session at --cwd be allowed to write PATH?
+
+    This is the decision the eventual pre-write gate makes. Exposing it as a
+    plain command means the policy can be reviewed and tested before anything
+    enforces it.
+    """
+    try:
+        own = Ownership.load(args.ownership)
+    except OwnershipError as exc:
+        print(f"scoot-rim-agentd: {exc}", file=sys.stderr)
+        return 2
+
+    cwd = args.cwd or os.getcwd()
+    decision = own.check(args.path, cwd)
+    verdict = "ALLOW" if decision.allowed else "DENY"
+    print(f"{verdict}  {args.path}")
+    print(f"       {decision.reason}")
+    if not decision.allowed and decision.owner_cwd:
+        print(f"       owner cwd: {decision.owner_cwd}")
+    return 0 if decision.allowed else 1
+
+
+def cmd_owner(args) -> int:
+    try:
+        own = Ownership.load(args.ownership)
+    except OwnershipError as exc:
+        print(f"scoot-rim-agentd: {exc}", file=sys.stderr)
+        return 2
+    node = own.owner_of(args.path)
+    if node is None:
+        print(f"{args.path}: outside any managed node")
+        return 1
+    print(f"{args.path}")
+    print(f"  node   : {node.path}")
+    print(f"  policy : {node.policy}")
+    if node.owns:
+        print(f"  owns   : {', '.join(node.owns)}")
+    if node.note:
+        print(f"  note   : {node.note}")
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """Report what would make the log untrustworthy to act on.
+
+    Note what this does NOT claim: an incomplete log is not a crisis when
+    sessions can simply be restarted — a clean bring-up makes it complete,
+    because sessions self-register at launch. It matters only where something
+    consults the log to make a decision.
+    """
+    log = _log(args)
+    state = _state(args)
+    problems = 0
+
+    if not log.path.exists():
+        print(f"no log at {log.path} — nothing has been recorded yet")
+        return 0
+
+    bad = log.malformed()
+    if bad:
+        print(f"MALFORMED  {bad} unparseable line(s) in {log.path}")
+        problems += bad
+
+    for s in state.sessions_sorted():
+        if not s.cwd:
+            print(f"NO-CWD     {s.name} ({s.backend_id}) — cannot be restored")
+            problems += 1
+        elif not Path(s.cwd).is_dir():
+            print(f"GONE-CWD   {s.name} — recorded cwd no longer exists: {s.cwd}")
+            problems += 1
+        if not s.bound:
+            print(f"UNBOUND    {s.name} ({s.backend_id}) — restore would be approximate")
+            problems += 1
+
+    for resource, holder in sorted(state.claims.items()):
+        if holder not in state.live:
+            print(f"STALE-CLAIM {resource} — held by a session no longer live")
+            problems += 1
+
+    print(f"\n{len(state.live)} live, {len(state.exited)} exited, "
+          f"{len(state.deferred)} deferred, {len(state.escalated)} escalated")
+    if problems == 0:
+        print("log is internally consistent and every live session is restorable")
+        return 0
+    print(f"{problems} issue(s) — see above")
+    return 1
+
+
+def cmd_event(args) -> int:
+    if len(args.kv) % 2 != 0:
+        print("scoot-rim-agentd: event fields must be key/value pairs", file=sys.stderr)
+        return 2
+    fields = dict(zip(args.kv[::2], args.kv[1::2]))
+    record = _log(args).append(args.type, **fields)
+    print(json.dumps(record, ensure_ascii=False))
+    return 0
+
+
+def cmd_tail(args) -> int:
+    records = list(_log(args).records())
+    for rec in records[-args.n:]:
+        print(json.dumps(rec, ensure_ascii=False))
+    return 0
+
+
+def cmd_path(args) -> int:
+    print(_log(args).path)
+    return 0
+
+
+# -- entry ------------------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scoot-rim-agentd",
+        description="Query the agent-session event log and ownership map.",
+    )
+    parser.add_argument("--log", help="event log path (default: $SCOOT_RIM_EVENTS)")
+    parser.add_argument("--ownership", help="ownership map (default: $SCOOT_RIM_OWNERSHIP)")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("live", help="sessions started and not exited (the recovery set)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_live)
+
+    sub.add_parser("open", help="deferred/escalated with no resume/decide").set_defaults(func=cmd_open)
+    sub.add_parser("claims", help="outstanding resource claims").set_defaults(func=cmd_claims)
+    sub.add_parser("restore-plan", help="what a restore would run (prints only)").set_defaults(func=cmd_restore_plan)
+    sub.add_parser("doctor", help="what would make this log untrustworthy").set_defaults(func=cmd_doctor)
+    sub.add_parser("path", help="where the log lives").set_defaults(func=cmd_path)
+
+    p = sub.add_parser("check", help="may a session at --cwd write PATH?")
+    p.add_argument("path")
+    p.add_argument("--cwd", help="calling session's cwd (default: this process's)")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("owner", help="which node owns PATH")
+    p.add_argument("path")
+    p.set_defaults(func=cmd_owner)
+
+    p = sub.add_parser("event", help="append an event")
+    p.add_argument("type")
+    p.add_argument("kv", nargs="*", metavar="KEY VALUE")
+    p.set_defaults(func=cmd_event)
+
+    p = sub.add_parser("tail", help="last N events")
+    p.add_argument("n", nargs="?", type=int, default=20)
+    p.set_defaults(func=cmd_tail)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
