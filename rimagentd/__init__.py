@@ -6,12 +6,12 @@ via $SCOOT_RIM_OWNERSHIP and are never committed here.
 """
 
 from .events import EventLog, default_log_path
-from .fold import Session, State, fold
+from .fold import KNOWN_EVENTS, Session, State, fold
 from .ownership import Decision, Node, Ownership, OwnershipError
 
 __all__ = [
     "EventLog", "default_log_path",
-    "fold", "State", "Session",
+    "fold", "State", "Session", "KNOWN_EVENTS",
     "Ownership", "Node", "Decision", "OwnershipError",
 ]
 __version__ = "0.1.0"

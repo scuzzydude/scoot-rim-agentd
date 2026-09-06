@@ -215,3 +215,79 @@ class TestOwnership(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestApiSnapshot(unittest.TestCase):
+    """The HTTP view must agree with the CLI, and must stay read-only."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = Path(self.dir.name)
+        self.root = d / "root"
+        for sub in ("components/a", "shared"):
+            (self.root / sub).mkdir(parents=True)
+        self.cfg = d / "own.toml"
+        self.cfg.write_text(
+            f'root = "{self.root}"\n'
+            '[[node]]\npath = "components/*"\npolicy = "own-subtree"\n'
+            '[[node]]\npath = "shared"\nowns = ["dashboard.html"]\npolicy = "handoff"\n'
+        )
+        self.log = d / "events.jsonl"
+        lg = EventLog(self.log)
+        lg.append("session_start", backend_id="1.a", name="alice",
+                  cwd=str(self.root / "components/a"))
+        lg.append("agent_bound", backend_id="1.a", agent_session_id="sess-a")
+        lg.append("session_start", backend_id="2.dash", name="dash",
+                  cwd=str(self.root / "shared"))
+        lg.append("defer", item="drawings", reason="awaiting review")
+        lg.append("escalate", question="which version", to="steve")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _snap(self):
+        from rimagentd.api import snapshot
+        return snapshot(self.log, self.cfg)
+
+    def test_snapshot_reports_policy_per_position(self):
+        snap = self._snap()
+        by = {s["name"]: s for s in snap["sessions"]}
+        self.assertEqual(by["alice"]["policy"], "own-subtree")
+        # The regression governing_node() exists for, now reached over HTTP:
+        # `shared` claims only dashboard.html, so owner_of() would say nothing.
+        self.assertEqual(by["dash"]["policy"], "handoff")
+
+    def test_snapshot_paths_are_relative_to_root(self):
+        by = {s["name"]: s for s in self._snap()["sessions"]}
+        self.assertEqual(by["alice"]["rel"], "components/a")
+
+    def test_snapshot_marks_unbound_and_restorable(self):
+        by = {s["name"]: s for s in self._snap()["sessions"]}
+        self.assertTrue(by["alice"]["bound"])
+        self.assertFalse(by["dash"]["bound"])
+        self.assertTrue(by["dash"]["restorable"])
+
+    def test_snapshot_carries_open_items(self):
+        snap = self._snap()
+        self.assertEqual([x["item"] for x in snap["deferred"]], ["drawings"])
+        self.assertEqual([x["question"] for x in snap["escalated"]], ["which version"])
+        self.assertEqual(snap["counts"]["unbound"], 1)
+
+    def test_snapshot_works_with_no_ownership_map(self):
+        """A host with no site config must still get its sessions."""
+        from rimagentd.api import snapshot
+        snap = snapshot(self.log, self.dir.name + "/absent.toml")
+        self.assertEqual(len(snap["sessions"]), 2)
+        self.assertEqual(snap["root"], "")
+        self.assertTrue(all(s["policy"] == "" for s in snap["sessions"]))
+
+    def test_api_declares_no_mutating_route(self):
+        """Read-only is a design constraint, not an oversight. If a POST/PUT/
+        DELETE handler is ever added, this test should fail and the author
+        should have to justify it."""
+        from rimagentd import api
+        handlers = [n for n in dir(api._Handler) if n.startswith("do_")]
+        self.assertEqual(sorted(handlers), ["do_GET", "do_HEAD", "do_POST"])
+        # do_POST exists only to answer 405.
+        import inspect
+        self.assertIn("read-only", inspect.getsource(api._Handler.do_POST))

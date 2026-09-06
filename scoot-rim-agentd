@@ -22,7 +22,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rimagentd import EventLog, Ownership, OwnershipError, fold  # noqa: E402
+from rimagentd import (  # noqa: E402
+    KNOWN_EVENTS, EventLog, Ownership, OwnershipError, fold,
+)
 
 
 def _log(args) -> EventLog:
@@ -383,11 +385,60 @@ def cmd_doctor(args) -> int:
     return 1
 
 
+def cmd_serve(args) -> int:
+    """Read-only HTTP view, for clients that cannot run this CLI (a tablet).
+
+    Localhost unless --bind says otherwise: reaching a host on a restricted
+    network from a tablet needs a decision about exposure, and that decision
+    belongs to whoever runs the host rather than to a default here.
+    """
+    from rimagentd.api import serve
+
+    token = args.token or ""
+    if args.token == "-":                      # generate one and print it once
+        import secrets
+        token = secrets.token_urlsafe(16)
+
+    url = f"http://{args.bind}:{args.port}/"
+    print(f"serving read-only view on {url}")
+    if args.bind not in ("127.0.0.1", "localhost"):
+        print(f"  NOTE: bound to {args.bind} — reachable beyond this host")
+    if token:
+        print(f"  token: {token}")
+        print(f"  open : {url}?token={token}")
+    else:
+        print("  no token — anyone who can reach this port can read session names/paths")
+    print("  read-only: no endpoint here can restore, kill or modify anything")
+    # Flush before blocking in serve_forever: stdout is block-buffered when
+    # redirected to a file or journal, so without this the banner -- including a
+    # generated token, which is printed exactly once -- stays invisible until
+    # the process dies.
+    sys.stdout.flush()
+    try:
+        serve(args.bind, args.port, token, args.log, args.ownership)
+    except KeyboardInterrupt:
+        print("\nstopped")
+    except OSError as exc:
+        print(f"scoot-rim-agentd: cannot serve on {args.bind}:{args.port} — {exc}",
+              file=sys.stderr)
+        return 2
+    return 0
+
+
 def cmd_event(args) -> int:
     if len(args.kv) % 2 != 0:
         print("scoot-rim-agentd: event fields must be key/value pairs", file=sys.stderr)
         return 2
     fields = dict(zip(args.kv[::2], args.kv[1::2]))
+    # Warn, do not reject: the log is append-only and extensible, so an unknown
+    # type is legal. But a typo is otherwise accepted in silence and the item
+    # never shows up in `open` -- which is how deferred work gets lost, the very
+    # thing this log exists to prevent. Found by making exactly this mistake.
+    if args.type not in KNOWN_EVENTS:
+        print(f"scoot-rim-agentd: note — '{args.type}' is not a type the fold acts on;"
+              f" it is recorded but will not appear in live/open/claims.",
+              file=sys.stderr)
+        print(f"  known: {', '.join(KNOWN_EVENTS)}", file=sys.stderr)
     record = _log(args).append(args.type, **fields)
     print(json.dumps(record, ensure_ascii=False))
     return 0
@@ -445,6 +496,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("owner", help="which node owns PATH")
     p.add_argument("path")
     p.set_defaults(func=cmd_owner)
+
+    p = sub.add_parser("serve", help="read-only HTTP view (for a tablet); localhost by default")
+    p.add_argument("--bind", default="127.0.0.1",
+                   help="address to bind (default 127.0.0.1; anything else is reachable off-host)")
+    p.add_argument("--port", type=int, default=4300)
+    p.add_argument("--token", default="",
+                   help="require this bearer token; '-' generates one and prints it")
+    p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("event", help="append an event")
     p.add_argument("type")

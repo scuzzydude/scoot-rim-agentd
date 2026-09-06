@@ -40,6 +40,21 @@ class State:
         return sorted(self.live.values(), key=lambda s: (s.name.lower(), s.backend_id))
 
 
+# Event types the fold acts on. Exported so a writer can be told when it used a
+# type nothing consumes: the log is append-only and extensible, so an unknown
+# type is legal and is kept -- but it also means a typo ("deferred" for "defer")
+# is accepted in silence and the item never appears in `open`. Losing deferred
+# work to silence is the exact failure this log exists to prevent, so the
+# vocabulary is published rather than left implicit in an if-chain.
+KNOWN_EVENTS = (
+    "session_start", "session_exit", "agent_bound", "agent_bind_failed",
+    "claim", "release",
+    "defer", "resume",
+    "escalate", "decide",
+    "reconcile", "restored", "gate_warn",
+)
+
+
 def fold(records: Iterable[dict]) -> State:
     """Replay records oldest-first into current state.
 

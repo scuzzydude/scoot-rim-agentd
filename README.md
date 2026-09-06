@@ -103,6 +103,32 @@ DENY  shared/dashboard.html
        owner cwd: /tree/shared
 ```
 
+### Read-only HTTP view (tablet client)
+
+```bash
+./scoot-rim-agentd serve                 # localhost:4300
+./scoot-rim-agentd serve --bind 0.0.0.0 --port 4300 --token -
+```
+
+Serves a single self-contained page plus `GET /snapshot` (one JSON response with
+sessions, policies, open items and claims). `GET /healthz` needs no token.
+
+Three constraints, all deliberate:
+
+- **Read-only. There are no mutating endpoints**, and a test asserts that no
+  `do_POST`-style handler is added without justifying it. The actions this
+  system can take — restore, kill — are exactly the ones that are dangerous to
+  trigger by accident, and a tablet is the worst place to expose them: a mis-tap
+  has no confirmation step and no shell history.
+- **Localhost unless told otherwise.** Reaching a host from a tablet needs a
+  decision about exposure (tunnel, VPN, LAN bind); that belongs to whoever runs
+  the host, not to a default.
+- **No external resources in the page.** The device that most needs this view is
+  on a flaky link; a page that waits on a CDN shows nothing.
+
+`--token` is a speed bump on a read-only view of session names, not
+authentication. Do not let it justify a wider bind.
+
 ### Ownership map
 
 See `examples/ownership.toml`. Three policies:
@@ -127,8 +153,8 @@ changes.
 
 ## Status
 
-Early. What works: the event log, the fold, ownership resolution, and the
-query CLI, with 24 tests.
+Early. What works: the event log, the fold, ownership resolution, the
+query CLI, and the read-only HTTP view with its browser client — 30 tests.
 
 Not built yet: the daemon itself (service + timer reconciliation), the pre-write
 gate that would call `check`, an HTTP API, and clients. `restore-plan` prints

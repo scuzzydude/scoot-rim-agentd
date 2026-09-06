@@ -1,0 +1,171 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>scoot-rim</title>
+<!--
+  Tablet client. Deliberately one self-contained file with no external
+  resources: the device that most needs this is on a flaky link or behind a
+  tunnel, and a page that waits on a CDN font is a page that shows nothing.
+
+  It is also a read-only view, matching the API (see api.py's docstring). There
+  are no buttons that do anything to a session -- a mis-tap on a tablet has no
+  confirmation step.
+-->
+<style>
+  :root {
+    --bg: #12141a; --panel: #1a1d26; --line: #2b303d;
+    --fg: #e6e9ef; --dim: #8b93a7;
+    --ok: #5fd08a; --warn: #e0b050; --bad: #e06c6c; --accent: #7aa2f7;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --line: #dde1e8;
+      --fg: #1a1d26; --dim: #666e80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px 12px 40px;
+    background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    -webkit-text-size-adjust: 100%;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    padding-bottom: 8px; border-bottom: 1px solid var(--line); margin-bottom: 12px;
+  }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .root { color: var(--dim); font-size: 13px; }
+  #status { margin-left: auto; font-size: 13px; color: var(--dim); }
+  #status.err { color: var(--bad); }
+
+  .counts { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+  .count {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 12px; min-width: 74px;
+  }
+  .count b { display: block; font-size: 22px; font-weight: 600; line-height: 1.2; }
+  .count span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .count.warn b { color: var(--warn); }
+  .count.bad  b { color: var(--bad); }
+
+  section { margin-bottom: 20px; }
+  h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .8px;
+    color: var(--dim); margin: 0 0 8px; font-weight: 600;
+  }
+  .tree { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+  .dir { color: var(--dim); white-space: pre; }
+  /* Touch target: 44px is the smallest reliably tappable row on a tablet, even
+     though nothing here is tappable yet -- it keeps rows readable at arm's
+     length, which is the actual use case. */
+  .sess { display: flex; align-items: center; gap: 8px; min-height: 34px; white-space: pre; }
+  .name { font-weight: 600; }
+  .pol { font-size: 12px; color: var(--dim); }
+  .pol.handoff { color: var(--accent); }
+  .pol.strict  { color: var(--warn); }
+  .tag {
+    font-size: 10px; padding: 1px 6px; border-radius: 4px; letter-spacing: .5px;
+    border: 1px solid currentColor;
+  }
+  .tag.unbound { color: var(--warn); }
+  .tag.gone    { color: var(--bad); }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 9px 12px; margin-bottom: 6px;
+  }
+  li .why { color: var(--dim); font-size: 13px; }
+  .empty { color: var(--dim); font-size: 13px; }
+</style>
+
+<header>
+  <h1>scoot-rim</h1>
+  <span class="root" id="root"></span>
+  <span id="status">loading…</span>
+</header>
+
+<div class="counts" id="counts"></div>
+<section><h2>Sessions by position</h2><div class="tree" id="tree"></div></section>
+<section><h2>Open — deferred &amp; escalated</h2><ul id="open"></ul></section>
+<section id="claims-wrap"><h2>Claims</h2><ul id="claims"></ul></section>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+// The page is served with its own token in the URL when one is configured, so
+// reuse whatever query string got us here rather than asking for it again.
+const QS = location.search;
+
+function renderCounts(c) {
+  const cards = [
+    ["live", c.live, ""],
+    ["unbound", c.unbound, c.unbound ? "warn" : ""],
+    ["deferred", c.deferred, c.deferred ? "warn" : ""],
+    ["escalated", c.escalated, c.escalated ? "bad" : ""],
+    ["exited", c.exited, ""],
+  ];
+  $("counts").innerHTML = cards.map(([label, n, cls]) =>
+    `<div class="count ${cls}"><b>${n}</b><span>${label}</span></div>`).join("");
+}
+
+function renderTree(root, sessions) {
+  if (!sessions.length) { $("tree").innerHTML = '<div class="empty">no live sessions</div>'; return; }
+  // Same shared-parent collapsing as the CLI's tree, so the two views agree.
+  const rows = sessions.slice().sort((a, b) => (a.rel || "").localeCompare(b.rel || ""));
+  let out = "", prev = [];
+  for (const s of rows) {
+    const parts = (!s.rel || s.rel === ".") ? [] : s.rel.split("/");
+    let common = 0;
+    while (common < parts.length && common < prev.length && parts[common] === prev[common]) common++;
+    for (let d = common; d < parts.length; d++)
+      out += `<div class="dir">${"  ".repeat(d + 1)}${esc(parts[d])}/</div>`;
+    prev = parts;
+    const pad = "  ".repeat(parts.length + 1);
+    const pol = s.policy ? `<span class="pol ${esc(s.policy)}">(${esc(s.policy)})</span>` : "";
+    const tags = (s.bound ? "" : '<span class="tag unbound">UNBOUND</span>') +
+                 (s.restorable ? "" : '<span class="tag gone">CWD GONE</span>');
+    out += `<div class="sess">${pad}<span class="name">* ${esc(s.name)}</span>${pol}${tags}</div>`;
+  }
+  $("tree").innerHTML = out;
+}
+
+function renderOpen(d, e) {
+  const items = [
+    ...e.map(x => `<li><b>ESCALATED</b> ${esc(x.question)}${x.to ? ` <span class="why">→ ${esc(x.to)}</span>` : ""}</li>`),
+    ...d.map(x => `<li><b>DEFERRED</b> ${esc(x.item)}${x.reason ? `<div class="why">${esc(x.reason)}</div>` : ""}</li>`),
+  ];
+  $("open").innerHTML = items.length ? items.join("") : '<li class="empty">nothing deferred or escalated</li>';
+}
+
+function renderClaims(claims) {
+  $("claims-wrap").hidden = claims.length === 0;
+  $("claims").innerHTML = claims.map(c =>
+    `<li>${esc(c.resource)} <span class="why">held by ${esc(c.holder_name)}${c.stale ? " — STALE" : ""}</span></li>`).join("");
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("snapshot" + QS, { cache: "no-store" });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    $("root").textContent = d.root || "(no ownership root)";
+    renderCounts(d.counts);
+    renderTree(d.root, d.sessions);
+    renderOpen(d.deferred, d.escalated);
+    renderClaims(d.claims);
+    $("status").className = "";
+    $("status").textContent = new Date().toLocaleTimeString();
+  } catch (err) {
+    // Say so rather than leaving stale numbers looking current: on a tablet
+    // this page may sit open for hours after the link drops.
+    $("status").className = "err";
+    $("status").textContent = "stale — " + err.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
+</script>
