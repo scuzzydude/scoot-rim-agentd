@@ -1,0 +1,21 @@
+# Close sessions the log thinks are live but the backend says are gone.
+#
+# Required, not cosmetic: a launcher returns when the user DETACHES, not when the
+# session ends, and a killed session never logs its own exit. Without this pass,
+# dead sessions look live forever — and a restore would then try to re-create
+# sessions that are actually still running.
+#
+# Install: copy to /etc/systemd/system/, edit User= and the paths, then
+#   systemctl enable --now scoot-rim-reconcile.timer
+
+[Unit]
+Description=scoot-rim-agentd session reconcile
+After=network.target
+
+[Service]
+Type=oneshot
+User=CHANGEME
+Environment="SCOOT_RIM_OWNERSHIP=/path/to/ownership.toml"
+ExecStart=/path/to/scoot-rim-agentd/scoot-rim-agentd reconcile --quiet
+StandardOutput=journal
+StandardError=journal

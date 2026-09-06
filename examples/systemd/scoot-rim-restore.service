@@ -1,0 +1,37 @@
+# Re-create the sessions that were live at shutdown.
+#
+# DELIBERATELY NOT ENABLED BY DEFAULT. Read this before enabling:
+#
+#   * `restore` refuses to act while any live session lacks an
+#     agent_session_id, because resuming those can only be done
+#     by directory — which silently attaches to the most recent
+#     conversation there, the wrong one where a directory has
+#     hosted several, and a blank one where the directory was
+#     renamed after the session started.
+#   * So enabling this is only meaningful once sessions register
+#     themselves (`scoot-rim register`). Check first:
+#         scoot-rim-agentd doctor
+#         scoot-rim-agentd restore --dry-run
+#   * It starts interactive agent sessions unattended. Decide that
+#     deliberately rather than inheriting it.
+#
+# Enable only after the dry run looks right:
+#   systemctl enable scoot-rim-restore.service
+
+[Unit]
+Description=scoot-rim-agentd restore live sessions after boot
+After=network.target
+
+[Service]
+Type=oneshot
+User=CHANGEME
+Environment="SCOOT_RIM_OWNERSHIP=/path/to/ownership.toml"
+# Reconcile first so sessions that died with the host are marked exited and are
+# not "restored" on top of themselves.
+ExecStartPre=/path/to/scoot-rim-agentd/scoot-rim-agentd reconcile --quiet
+ExecStart=/path/to/scoot-rim-agentd/scoot-rim-agentd restore
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

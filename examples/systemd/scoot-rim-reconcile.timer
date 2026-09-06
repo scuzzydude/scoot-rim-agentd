@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic scoot-rim-agentd reconcile
+
+[Timer]
+# Frequent enough that a dead session is noticed quickly, infrequent enough to
+# be free. Persistent so a missed run (host off) fires on next boot.
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
