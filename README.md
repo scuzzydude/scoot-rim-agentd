@@ -65,6 +65,7 @@ safe to parallelise.
 
 ```bash
 ./scoot-rim-agentd live            # sessions started and not exited — the recovery set
+./scoot-rim-agentd tree            # the same set grouped by position, annotated with policy
 ./scoot-rim-agentd doctor          # what would make this log untrustworthy to act on
 ./scoot-rim-agentd restore-plan    # what a restore WOULD run; prints only, never acts
 ./scoot-rim-agentd open            # deferred/escalated with no resume/decide
@@ -74,6 +75,20 @@ safe to parallelise.
 # ownership (needs $SCOOT_RIM_OWNERSHIP)
 ./scoot-rim-agentd owner  path/to/file
 ./scoot-rim-agentd check  path/to/file --cwd /where/the/session/is
+```
+
+`tree` groups by *position* rather than listing by name, because position is
+what determines ownership, policy and restore everywhere else in this design:
+
+```
+$ scoot-rim-agentd tree
+/tree
+  * root-session  (strict)
+  components/
+    a/
+      * alice  (own-subtree)
+  shared/
+    * dash  (handoff)  [UNBOUND]
 ```
 
 `check` exits 0 for allow, 1 for deny — it is the decision a pre-write gate
@@ -113,7 +128,7 @@ changes.
 ## Status
 
 Early. What works: the event log, the fold, ownership resolution, and the
-query CLI, with 21 tests.
+query CLI, with 24 tests.
 
 Not built yet: the daemon itself (service + timer reconciliation), the pre-write
 gate that would call `check`, an HTTP API, and clients. `restore-plan` prints

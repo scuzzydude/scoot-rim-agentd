@@ -141,6 +141,36 @@ class Ownership:
             return under
         return any(fnmatch.fnmatch(remainder, g) or fnmatch.fnmatch(rel, g) for g in node.owns)
 
+    def governing_node(self, directory: str) -> Node | None:
+        """Deepest node whose path contains `directory`, ignoring `owns`.
+
+        Distinct from owner_of() and not interchangeable with it. owner_of()
+        answers "who owns this FILE" and honours `owns`, so a node claiming only
+        specific globs does not match its own directory — asking it about a
+        directory returns nothing, and a session sitting in a governed directory
+        appears ungoverned.
+
+        This answers the other question: "what policy applies at this POSITION".
+        It is what a display or a restore wants, because both are keyed on where
+        a session sits rather than on any one file.
+        """
+        rel = self.relative(directory)
+        if rel is None:
+            return None
+        best: Node | None = None
+        for node in self.nodes:
+            node_path = "" if node.path in ("", ".") else node.path
+            contains = (
+                node_path == ""
+                or rel == node_path
+                or rel.startswith(node_path + "/")
+                or fnmatch.fnmatch(rel, node_path)
+                or fnmatch.fnmatch(rel, node_path + "/*")
+            )
+            if contains and (best is None or node.depth >= best.depth):
+                best = node
+        return best
+
     def owner_of(self, target: str) -> Node | None:
         """Most specific node claiming `target`. Deeper paths win; among equals,
         a node with explicit `owns` beats one claiming a whole subtree, because

@@ -50,6 +50,67 @@ def cmd_live(args) -> int:
     return 0
 
 
+def cmd_tree(args) -> int:
+    """Live sessions as a tree, grouped by position under the ownership root.
+
+    Position is the organising fact everywhere else in this design — ownership,
+    policy, restore — so it is what the display groups by too, rather than a flat
+    list sorted by name. Reads the ownership map when available to annotate each
+    node's policy; degrades to a plain tree when no map is configured, since
+    seeing the sessions is useful even without policy.
+    """
+    state = _state(args)
+    if not state.live:
+        print("no live sessions in the log")
+        return 0
+
+    root = ""
+    policies: dict[str, str] = {}
+    try:
+        own = Ownership.load(args.ownership)
+        root = own.root
+        for session in state.live.values():
+            if not session.cwd:
+                continue
+            # governing_node(), not owner_of(): the tree is keyed on POSITION,
+            # and owner_of() honours `owns`, so a node claiming only specific
+            # globs would report no policy for its own directory.
+            node = own.governing_node(session.cwd)
+            if node is not None:
+                policies[session.backend_id] = node.policy
+    except OwnershipError:
+        pass  # no map configured — still worth showing the tree
+
+    # Group by path relative to root, so the tree mirrors the directory shape.
+    rows: list[tuple[str, object]] = []
+    for session in state.sessions_sorted():
+        rel = session.cwd
+        if root and session.cwd.startswith(root):
+            rel = session.cwd[len(root):].strip("/") or "."
+        rows.append((rel, session))
+    rows.sort(key=lambda r: r[0])
+
+    print(root or "(no ownership root configured)")
+    prev: list[str] = []
+    for i, (rel, session) in enumerate(rows):
+        parts = [] if rel == "." else rel.split("/")
+        # Print only the path segments that differ from the previous row, so
+        # shared parents appear once instead of being repeated per session.
+        common = 0
+        while common < len(parts) and common < len(prev) and parts[common] == prev[common]:
+            common += 1
+        for depth in range(common, len(parts)):
+            print(f"{'  ' * (depth + 1)}{parts[depth]}/")
+        prev = parts
+
+        indent = "  " * (len(parts) + 1)
+        mark = "" if session.bound else "  [UNBOUND]"
+        policy = policies.get(session.backend_id, "")
+        tag = f"  ({policy})" if policy else ""
+        print(f"{indent}* {session.name}{tag}{mark}")
+    return 0
+
+
 def cmd_open(args) -> int:
     """Deferred and escalated items with no matching resume/decide.
 
@@ -106,6 +167,130 @@ def cmd_restore_plan(args) -> int:
             f"(cd {shlex.quote(s.cwd)} && screen -dmS {shlex.quote(s.name)} && "
             f"screen -S {shlex.quote(s.name)} -X stuff {shlex.quote(inner + chr(13))})"
         )
+    return 0
+
+
+def cmd_restore(args) -> int:
+    """Actually re-create live sessions. Guarded, and refuses by default when it
+    would restore the wrong thing.
+
+    The dangerous case is an UNBOUND session: with no agent_session_id the only
+    option is resume-by-directory, which silently picks the most recent
+    conversation in that directory. Where a directory has hosted several, that
+    is the wrong one — and where the directory was renamed after the session
+    started, there is no matching project dir at all and you get a blank
+    session wearing the right name. So unbound sessions are skipped unless
+    --allow-approximate says otherwise.
+    """
+    state = _state(args)
+    log = _log(args)
+
+    if not state.live:
+        print("nothing to restore")
+        return 0
+
+    unbound = [s for s in state.sessions_sorted() if not s.bound]
+    if unbound and not args.allow_approximate:
+        print("refusing to restore: these sessions have no agent_session_id, so")
+        print("resuming them would attach to the wrong conversation or a blank one:")
+        for s in unbound:
+            print(f"  {s.name} ({s.backend_id})")
+        print("\nfix: run 'scoot-rim register' inside each, or pass --allow-approximate")
+        return 1
+
+    import subprocess
+
+    existing = set()
+    try:
+        out = subprocess.run(["screen", "-ls"], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            parts = line.split("\t")
+            if len(parts) > 1 and "." in parts[1]:
+                existing.add(parts[1].split(".", 1)[1])
+    except FileNotFoundError:
+        print("restore: 'screen' not found — cannot restore", file=sys.stderr)
+        return 2
+
+    restored = skipped = 0
+    for s in state.sessions_sorted():
+        if not s.cwd or not Path(s.cwd).is_dir():
+            print(f"SKIP  {s.name} — cwd missing: {s.cwd or '<none>'}")
+            skipped += 1
+            continue
+        if s.name in existing:
+            print(f"SKIP  {s.name} — a session by that name is already running")
+            skipped += 1
+            continue
+        if not s.bound and not args.allow_approximate:
+            skipped += 1
+            continue
+
+        inner = (f"claude --resume {s.agent_session_id}" if s.bound else "claude --continue")
+        if args.dry_run:
+            print(f"WOULD {s.name}: {inner}  (cwd {s.cwd})")
+            continue
+
+        subprocess.run(["screen", "-dmS", s.name], cwd=s.cwd, check=False)
+        subprocess.run(["screen", "-S", s.name, "-X", "stuff", inner + "\r"], check=False)
+        log.append(
+            "restored",
+            name=s.name,
+            cwd=s.cwd,
+            agent_session_id=s.agent_session_id,
+            mode="resume" if s.bound else "continue-approximate",
+        )
+        print(f"RESTORED {s.name}  ({'resume' if s.bound else 'APPROXIMATE'})")
+        restored += 1
+
+    print(f"\n{restored} restored, {skipped} skipped")
+    return 0
+
+
+def _live_backend_names() -> set[str] | None:
+    """Backend ids currently alive. None if the backend can't be queried, which
+    must be distinguished from "nothing is alive" — reconciling on a failed
+    query would mark every session dead."""
+    import subprocess
+    try:
+        out = subprocess.run(["screen", "-ls"], capture_output=True, text=True).stdout
+    except FileNotFoundError:
+        return None
+    ids = set()
+    for line in out.splitlines():
+        parts = line.split("\t")          # tab-delimited; names may contain spaces
+        if len(parts) > 1 and "." in parts[1]:
+            ids.add(parts[1].strip())
+    return ids
+
+
+def cmd_reconcile(args) -> int:
+    """Close sessions the log thinks are live but the backend says are gone.
+
+    Required rather than cosmetic: a session launcher returns when the user
+    DETACHES, not when the session ends, and a killed session never logs its own
+    exit. Without this, dead sessions look live forever — and a restore would
+    try to re-create sessions that are actually still running, or skip real ones.
+    """
+    alive = _live_backend_names()
+    if alive is None:
+        print("reconcile: cannot query the session backend — refusing to guess",
+              file=sys.stderr)
+        return 2
+
+    state = _state(args)
+    log = _log(args)
+    closed = 0
+    for s in state.sessions_sorted():
+        if s.backend_id not in alive:
+            log.append("session_exit", backend_id=s.backend_id, name=s.name,
+                       reason="reconciled: backend reports not alive")
+            if not args.quiet:
+                print(f"closed {s.name} ({s.backend_id})")
+            closed += 1
+    if closed:
+        log.append("reconcile", closed=str(closed))
+    if not args.quiet:
+        print(f"{closed} closed" if closed else "nothing to reconcile")
     return 0
 
 
@@ -238,7 +423,18 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("open", help="deferred/escalated with no resume/decide").set_defaults(func=cmd_open)
     sub.add_parser("claims", help="outstanding resource claims").set_defaults(func=cmd_claims)
     sub.add_parser("restore-plan", help="what a restore would run (prints only)").set_defaults(func=cmd_restore_plan)
+
+    p = sub.add_parser("restore", help="re-create live sessions (guarded)")
+    p.add_argument("--dry-run", action="store_true", help="show what would run")
+    p.add_argument("--allow-approximate", action="store_true",
+                   help="also restore sessions with no agent_session_id (may resume the WRONG conversation)")
+    p.set_defaults(func=cmd_restore)
     sub.add_parser("doctor", help="what would make this log untrustworthy").set_defaults(func=cmd_doctor)
+    sub.add_parser("tree", help="live sessions as a tree, grouped by position").set_defaults(func=cmd_tree)
+
+    p = sub.add_parser("reconcile", help="close sessions the backend says are gone")
+    p.add_argument("--quiet", action="store_true", help="only errors (for timers)")
+    p.set_defaults(func=cmd_reconcile)
     sub.add_parser("path", help="where the log lives").set_defaults(func=cmd_path)
 
     p = sub.add_parser("check", help="may a session at --cwd write PATH?")

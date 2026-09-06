@@ -158,6 +158,30 @@ class TestOwnership(unittest.TestCase):
                            str(self.root / "components/a"))
         self.assertFalse(d.allowed)
 
+    def test_governing_node_finds_policy_for_a_directory_owner_of_misses(self):
+        """The regression this method exists for.
+
+        `shared` lists `owns`, so it claims only dashboard.html — asking
+        owner_of() about the DIRECTORY finds no handoff node, and a session
+        sitting there looks ungoverned. governing_node() is keyed on position
+        and must still report handoff."""
+        self.assertNotEqual(
+            getattr(self.own.owner_of(str(self.root / "shared")), "policy", None),
+            "handoff",
+        )
+        node = self.own.governing_node(str(self.root / "shared"))
+        self.assertEqual(node.policy, "handoff")
+
+    def test_governing_node_prefers_the_deeper_node(self):
+        """Root is a node here ("."), so every directory matches it. A session
+        inside components/a must report that node's policy, not root's."""
+        node = self.own.governing_node(str(self.root / "components/a"))
+        self.assertEqual(node.policy, "own-subtree")
+        self.assertEqual(node.path, "components/*")
+
+    def test_governing_node_outside_root_is_none(self):
+        self.assertIsNone(self.own.governing_node("/etc"))
+
     def test_path_outside_root_is_allowed(self):
         d = self.own.check("/etc/hosts", str(self.root / "shared"))
         self.assertTrue(d.allowed)
