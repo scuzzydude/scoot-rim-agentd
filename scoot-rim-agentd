@@ -301,18 +301,36 @@ def cmd_reconcile(args) -> int:
 
     state = _state(args)
     log = _log(args)
-    closed = 0
+    closed = held = 0
     for s in state.sessions_sorted():
-        if s.backend_id not in alive:
-            log.append("session_exit", backend_id=s.backend_id, name=s.name,
-                       reason="reconciled: backend reports not alive")
+        if s.backend_id in alive:
+            continue
+        # A session from a previous boot did not END -- the host restarted under
+        # it. Closing it here would destroy the recovery set, and this timer runs
+        # at boot (Persistent=true), so it would do so before anything could
+        # restore. Verified: it emptied all twelve in one pass.
+        if s.from_previous_boot and not args.close_previous_boot:
             if not args.quiet:
-                print(f"closed {s.name} ({s.backend_id})")
-            closed += 1
+                print(f"held  {s.name} — was running before the last reboot; "
+                      f"awaiting restore")
+            held += 1
+            continue
+        log.append("session_exit", backend_id=s.backend_id, name=s.name,
+                   reason="reconciled: backend reports not alive")
+        if not args.quiet:
+            print(f"closed {s.name} ({s.backend_id})")
+        closed += 1
     if closed:
         log.append("reconcile", closed=str(closed))
     if not args.quiet:
-        print(f"{closed} closed" if closed else "nothing to reconcile")
+        parts = []
+        if closed:
+            parts.append(f"{closed} closed")
+        if held:
+            parts.append(f"{held} held for restore")
+        print(", ".join(parts) if parts else "nothing to reconcile")
+    if held and not args.quiet:
+        print("run 'scoot-rim-agentd restore' to bring the held sessions back")
     return 0
 
 
@@ -569,6 +587,8 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("reconcile", help="close sessions the backend says are gone")
     p.add_argument("--quiet", action="store_true", help="only errors (for timers)")
+    p.add_argument("--close-previous-boot", action="store_true",
+                   help="also close sessions lost to a reboot (DISCARDS the recovery set)")
     p.set_defaults(func=cmd_reconcile)
     sub.add_parser("path", help="where the log lives").set_defaults(func=cmd_path)
 

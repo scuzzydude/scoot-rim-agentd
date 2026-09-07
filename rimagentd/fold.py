@@ -8,7 +8,15 @@ special code path — it is just this fold, run after a reboot.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Iterable
+
+from .events import boot_time, current_boot_id
+
+# Read once per process. Both are constant for the life of a boot, and a fold is
+# a hot path (every CLI command, every gate invocation).
+_CURRENT_BOOT = current_boot_id()
+_BOOT_TIME = boot_time()
 
 
 @dataclass
@@ -18,6 +26,7 @@ class Session:
     cwd: str = ""
     agent_session_id: str = ""
     origin: str = ""
+    boot_id: str = ""
     started_at: str = ""
 
     @property
@@ -27,9 +36,30 @@ class Session:
         approximately."""
         return bool(self.agent_session_id)
 
+    @property
+    def from_previous_boot(self) -> bool:
+        """True when this session was running before the host last restarted.
+
+        Such a session is NOT live -- its backend died with the reboot -- but
+        neither did it end. It is the recovery set, and conflating it with an
+        ordinary exit destroys exactly what this log exists to preserve.
+        """
+        if self.boot_id and _CURRENT_BOOT:
+            return self.boot_id != _CURRENT_BOOT
+        # No boot_id recorded (older event): fall back to whether the start
+        # predates the current boot. Weaker, because it trusts the clock.
+        if self.started_at and _BOOT_TIME:
+            try:
+                return datetime.fromisoformat(self.started_at).timestamp() < _BOOT_TIME
+            except ValueError:
+                return False
+        return False
+
 
 @dataclass
 class State:
+    # Sessions whose backend the log still believes in. After a reboot these are
+    # not running; `pending` separates that case out.
     live: dict[str, Session] = field(default_factory=dict)
     exited: dict[str, Session] = field(default_factory=dict)
     claims: dict[str, str] = field(default_factory=dict)      # resource -> backend_id
@@ -39,6 +69,22 @@ class State:
     def sessions_sorted(self) -> list[Session]:
         return sorted(self.live.values(), key=lambda s: (s.name.lower(), s.backend_id))
 
+    @property
+    def pending(self) -> list[Session]:
+        """Sessions that were running before the last reboot: the recovery set.
+
+        Present in `live` too, because the log has recorded no exit for them --
+        which is correct, they never ended. Callers that mean "running right
+        now" must exclude these; callers that mean "restore what was lost" want
+        exactly these.
+        """
+        return [s for s in self.sessions_sorted() if s.from_previous_boot]
+
+    @property
+    def running(self) -> list[Session]:
+        """Sessions from the current boot -- actually running, absent a crash."""
+        return [s for s in self.sessions_sorted() if not s.from_previous_boot]
+
 
 # Event types the fold acts on. Exported so a writer can be told when it used a
 # type nothing consumes: the log is append-only and extensible, so an unknown
@@ -47,6 +93,7 @@ class State:
 # work to silence is the exact failure this log exists to prevent, so the
 # vocabulary is published rather than left implicit in an if-chain.
 KNOWN_EVENTS = (
+    "host_boot",
     "session_start", "session_exit", "agent_bound", "agent_bind_failed",
     "claim", "release",
     "defer", "resume",
@@ -74,6 +121,7 @@ def fold(records: Iterable[dict]) -> State:
                 name=rec.get("name", ""),
                 cwd=rec.get("cwd", ""),
                 origin=rec.get("origin", ""),
+                boot_id=rec.get("boot_id", ""),
                 started_at=rec.get("ts", ""),
             )
 

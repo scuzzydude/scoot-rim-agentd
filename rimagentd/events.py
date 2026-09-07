@@ -29,6 +29,34 @@ from typing import Any, Iterator
 SCHEMA_VERSION = 1
 
 
+def current_boot_id() -> str:
+    """Identifier for the running kernel boot; changes on every reboot.
+
+    Preferred over comparing timestamps to boot time because it is immune to the
+    clock moving — this host has had its clock jump by a day, which would make a
+    timestamp comparison silently misclassify sessions.
+    """
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+def boot_time() -> float:
+    """Unix time the host booted, or 0.0 if unavailable.
+
+    Fallback for records written before boot_id was recorded: a session whose
+    start predates the current boot cannot still be running.
+    """
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if line.startswith("btime "):
+                return float(line.split()[1])
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
 def default_log_path() -> Path:
     """Log location, overridable so tests never touch the real one."""
     home = os.environ.get("SCOOT_RIM_HOME") or str(Path.home() / ".scoot-rim")
@@ -50,6 +78,12 @@ class EventLog:
             "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
             "event": event,
             "host": socket.gethostname().split(".")[0],
+            # Which boot this happened under. Load-bearing for recovery: after a
+            # reboot every session's backend is gone, and without this there is
+            # no way to tell "this session ended" from "the host restarted under
+            # it". Conflating the two lets a reconcile pass close the entire
+            # recovery set before anything can restore it.
+            "boot_id": current_boot_id(),
         }
         for key, value in fields.items():
             if value is None or value == "":

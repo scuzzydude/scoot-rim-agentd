@@ -4,6 +4,7 @@ stdlib unittest only — the package has no dependencies and neither do its test
 Run: python3 -m unittest discover -s tests
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -413,3 +414,65 @@ class TestBinding(unittest.TestCase):
     def test_underscore_and_slash_both_collapse_in_the_directory_name(self):
         from rimagentd.binding import encode_cwd
         self.assertEqual(encode_cwd("/a/b_c/d"), "-a-b-c-d")
+
+
+class TestRebootRecovery(unittest.TestCase):
+    """The reboot path, which is the reason this log exists at all.
+
+    After a reboot every session's backend is gone. Treating that as "the
+    session ended" and closing them empties the recovery set — and because the
+    reconcile timer is Persistent=true it fires AT boot, so it would do this
+    before anything could restore. Verified against the real log: one pass
+    closed all twelve.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.log = EventLog(Path(self.dir.name) / "events.jsonl")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_session_from_a_previous_boot_is_pending_not_running(self):
+        self.log.append("session_start", backend_id="1.a", name="a", cwd="/x",
+                        boot_id="an-older-boot")
+        state = fold(self.log.records())
+        self.assertEqual([s.name for s in state.pending], ["a"])
+        self.assertEqual(state.running, [])
+
+    def test_session_from_this_boot_is_running_not_pending(self):
+        self.log.append("session_start", backend_id="1.a", name="a", cwd="/x")
+        state = fold(self.log.records())
+        self.assertEqual([s.name for s in state.running], ["a"])
+        self.assertEqual(state.pending, [])
+
+    def test_boot_id_is_stamped_on_every_event(self):
+        """Without it there is no way to tell an ended session from a rebooted
+        host, so it must not be optional."""
+        from rimagentd.events import current_boot_id
+        self.log.append("session_start", backend_id="1.a", name="a")
+        self.assertEqual(next(iter(self.log.records()))["boot_id"], current_boot_id())
+
+    def test_missing_boot_id_falls_back_to_start_time_vs_boot_time(self):
+        """Records written before boot_id existed must still classify. A start
+        that predates the current boot cannot still be running."""
+        self.log.append("session_start", backend_id="1.old", name="old", cwd="/x")
+        rewritten = []
+        for rec in self.log.records():
+            rec.pop("boot_id", None)
+            rec["ts"] = "2001-01-01T00:00:00+00:00"
+            rewritten.append(json.dumps(rec))
+        self.log.path.write_text("\n".join(rewritten) + "\n")
+        self.assertEqual([s.name for s in fold(self.log.records()).pending], ["old"])
+
+    def test_unparseable_timestamp_does_not_classify_as_pending(self):
+        """Guessing here would either discard a live session or resurrect a dead
+        one, so an unreadable timestamp must fall through to 'not pending'."""
+        self.log.append("session_start", backend_id="1.a", name="a", cwd="/x")
+        rewritten = []
+        for rec in self.log.records():
+            rec.pop("boot_id", None)
+            rec["ts"] = "not-a-timestamp"
+            rewritten.append(json.dumps(rec))
+        self.log.path.write_text("\n".join(rewritten) + "\n")
+        self.assertEqual(fold(self.log.records()).pending, [])
