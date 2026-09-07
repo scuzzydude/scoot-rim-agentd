@@ -476,3 +476,28 @@ class TestRebootRecovery(unittest.TestCase):
             rewritten.append(json.dumps(rec))
         self.log.path.write_text("\n".join(rewritten) + "\n")
         self.assertEqual(fold(self.log.records()).pending, [])
+
+
+class TestCwdCorrection(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.log = EventLog(Path(self.dir.name) / "events.jsonl")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_cwd_correction_replaces_recorded_position(self):
+        """A renamed directory leaves the recorded position pointing at nothing,
+        which makes restore skip the session."""
+        self.log.append("session_start", backend_id="1.a", name="a", cwd="/old")
+        self.log.append("cwd_corrected", backend_id="1.a", cwd="/new")
+        self.assertEqual(fold(self.log.records()).live["1.a"].cwd, "/new")
+
+    def test_correction_for_an_unknown_session_is_ignored(self):
+        self.log.append("cwd_corrected", backend_id="9.ghost", cwd="/new")
+        self.assertEqual(fold(self.log.records()).live, {})
+
+    def test_correction_without_a_cwd_does_not_blank_the_position(self):
+        self.log.append("session_start", backend_id="1.a", name="a", cwd="/old")
+        self.log.append("cwd_corrected", backend_id="1.a")
+        self.assertEqual(fold(self.log.records()).live["1.a"].cwd, "/old")

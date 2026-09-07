@@ -527,6 +527,47 @@ def cmd_suggest_bindings(args) -> int:
     return 0
 
 
+def cmd_fix_cwd(args) -> int:
+    """Correct a session's recorded working directory.
+
+    Needed when a directory is renamed under a running session: the recorded
+    position then points at something that no longer exists, and restore skips
+    the session rather than reopening it somewhere wrong.
+
+    Refuses a target that does not exist, because the whole failure being fixed
+    is a recorded path that is not real. Position governs ownership as well as
+    restore, so this is logged as its own event and never inferred.
+    """
+    state = _state(args)
+    match = [s for s in state.sessions_sorted()
+             if args.name in (s.name, s.backend_id)]
+    if not match:
+        print(f"scoot-rim-agentd: no live session named {args.name!r}", file=sys.stderr)
+        return 2
+    if len(match) > 1:
+        print(f"scoot-rim-agentd: {args.name!r} matches several sessions; "
+              f"use a backend_id: {', '.join(s.backend_id for s in match)}",
+              file=sys.stderr)
+        return 2
+
+    session = match[0]
+    new = str(Path(args.cwd).resolve())
+    if not Path(new).is_dir():
+        print(f"scoot-rim-agentd: {new} is not a directory — refusing "
+              f"(a recorded path that is not real is the bug being fixed)",
+              file=sys.stderr)
+        return 2
+    if new == session.cwd:
+        print(f"{session.name} already records {new}")
+        return 0
+
+    _log(args).append("cwd_corrected", backend_id=session.backend_id,
+                      name=session.name, cwd=new, previous_cwd=session.cwd,
+                      reason=args.reason)
+    print(f"{session.name}: {session.cwd or '<none>'}\n  -> {new}")
+    return 0
+
+
 def cmd_event(args) -> int:
     if len(args.kv) % 2 != 0:
         print("scoot-rim-agentd: event fields must be key/value pairs", file=sys.stderr)
@@ -616,6 +657,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--include-uncertain", action="store_true",
                    help="with --apply, also record medium/low matches (may bind the WRONG conversation)")
     p.set_defaults(func=cmd_suggest_bindings)
+
+    p = sub.add_parser("fix-cwd", help="correct a session's recorded directory (e.g. after a rename)")
+    p.add_argument("name", help="session name or backend_id")
+    p.add_argument("cwd", help="the directory it is actually in; must exist")
+    p.add_argument("--reason", default="", help="why, for the log")
+    p.set_defaults(func=cmd_fix_cwd)
 
     p = sub.add_parser("event", help="append an event")
     p.add_argument("type")

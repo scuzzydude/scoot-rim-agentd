@@ -95,6 +95,7 @@ class State:
 KNOWN_EVENTS = (
     "host_boot",
     "session_start", "session_exit", "agent_bound", "agent_bind_failed",
+    "cwd_corrected",
     "claim", "release",
     "defer", "resume",
     "escalate", "decide",
@@ -132,6 +133,15 @@ def fold(records: Iterable[dict]) -> State:
                 # adopted session closed before it was ever recorded as started.
                 session = Session(backend_id=bid, name=rec.get("name", ""))
             state.exited[bid] = session
+
+        elif event == "cwd_corrected" and bid:
+            # A session's recorded position was wrong -- usually its directory
+            # was renamed under it. Position governs ownership and restore, so
+            # this is a deliberate, logged correction rather than something a
+            # timer infers.
+            session = state.live.get(bid)
+            if session is not None and rec.get("cwd"):
+                session.cwd = rec["cwd"]
 
         elif event == "agent_bound" and bid:
             session = state.live.get(bid)
