@@ -254,10 +254,50 @@ def cmd_restore(args) -> int:
 
         subprocess.run(["screen", "-dmS", s.name], cwd=s.cwd, check=False)
         subprocess.run(["screen", "-S", s.name, "-X", "stuff", inner + "\r"], check=False)
+
+        # The new backend id, so the replacement session is recorded rather than
+        # left to self-register. Restored sessions do NOT self-register: the
+        # shell that starts has no agent session id yet (the agent has not
+        # launched), and nothing re-runs registration once it has. Observed
+        # live -- 11 of 13 restored screens were absent from the log, which also
+        # silently voided a claim, because the fold drops claims held by a
+        # session it does not know.
+        new_id = ""
+        try:
+            out = subprocess.run(["screen", "-ls"], capture_output=True,
+                                 text=True).stdout
+            for line in out.splitlines():
+                parts = line.split("\t")
+                if len(parts) > 1 and parts[1].strip().endswith("." + s.name):
+                    cand = parts[1].strip()
+                    if cand != s.backend_id:
+                        new_id = cand
+                        break
+        except FileNotFoundError:
+            pass
+
+        # Close the pre-reboot record FIRST. Without this the held session stays
+        # live forever: reconcile deliberately will not close a previous-boot
+        # session (that would destroy the recovery set), and nothing else did --
+        # so all twelve accumulated as permanent ghosts alongside their own
+        # replacements. Superseding is the one case where closing it is right,
+        # because a successor now exists.
+        if new_id and new_id != s.backend_id:
+            log.append("session_exit", backend_id=s.backend_id, name=s.name,
+                       reason=f"superseded by restore as {new_id}")
+            log.append("session_start", name=s.name, backend_id=new_id,
+                       cwd=s.cwd, pid=new_id.split(".", 1)[0], origin="restored")
+            if s.bound:
+                log.append("agent_bound", backend_id=new_id,
+                           agent_session_id=s.agent_session_id, cwd=s.cwd,
+                           origin="restored")
+
         log.append(
             "restored",
             name=s.name,
             cwd=s.cwd,
+            backend_id=new_id or s.backend_id,
+            previous_backend_id=s.backend_id if new_id else "",
             agent_session_id=s.agent_session_id,
             mode="resume" if s.bound else "continue-approximate",
         )
