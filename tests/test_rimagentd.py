@@ -416,6 +416,86 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(encode_cwd("/a/b_c/d"), "-a-b-c-d")
 
 
+class TestSymlinkedCwd(unittest.TestCase):
+    """A session launched through a symlinked path.
+
+    Seen live: /srv/bregman is a symlink to /srv/steveai/bregman, and four
+    sessions ran with a cwd under the symlink while their conversations were
+    filed under the resolved path. The binder derived the project directory from
+    the literal cwd, found nothing, and left agent_session_id empty — silently,
+    with no error anywhere. Downstream, a display joining on that id drew no
+    live row for those four.
+
+    These tests pin both directions, because which spelling the runtime files
+    under is the runtime's business and could change.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.dir.name)
+        self.projects = self.root / "projects"
+        self.projects.mkdir()
+        # real/deep/tree  <-  link  (mirrors /srv/bregman -> /srv/steveai/bregman)
+        self.real = self.root / "real" / "deep" / "tree"
+        self.real.mkdir(parents=True)
+        self.link = self.root / "link"
+        self.link.symlink_to(self.root / "real")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _mk(self, cwd, session_id, age_s=60, cwds=()):
+        from rimagentd.binding import encode_cwd
+        d = self.projects / encode_cwd(str(cwd))
+        d.mkdir(exist_ok=True)
+        f = d / f"{session_id}.jsonl"
+        f.write_text("".join(
+            '{"sessionId":"%s","cwd":"%s"}\n' % (session_id, c) for c in cwds
+        ) or '{"sessionId":"%s"}\n' % session_id)
+        t = __import__("time").time() - age_s
+        os.utime(f, (t, t))
+        return f
+
+    def test_cwd_variants_adds_resolved_form_literal_first(self):
+        from rimagentd.binding import cwd_variants
+        v = cwd_variants(str(self.link / "deep" / "tree"))
+        self.assertEqual(len(v), 2)
+        self.assertTrue(v[0].startswith(str(self.link)), "literal must stay first")
+        self.assertEqual(v[1], str(self.real))
+
+    def test_cwd_variants_is_a_noop_without_a_symlink(self):
+        from rimagentd.binding import cwd_variants
+        self.assertEqual(cwd_variants(str(self.real)), [str(self.real)])
+        self.assertEqual(cwd_variants(""), [""])
+
+    def test_transcript_filed_under_resolved_path_binds_from_symlinked_cwd(self):
+        """The live failure. Session cwd is the symlink; conversation is filed
+        under the resolved path."""
+        from rimagentd.binding import candidates_for
+        self._mk(self.real, "sid-real", age_s=5)
+        got = candidates_for(str(self.link / "deep" / "tree"), projects=self.projects)
+        self.assertEqual([c.session_id for c in got], ["sid-real"])
+
+    def test_transcript_filed_under_symlinked_path_still_binds(self):
+        """The other direction, so the fix does not depend on which spelling the
+        runtime happens to use."""
+        from rimagentd.binding import candidates_for
+        link_cwd = str(self.link / "deep" / "tree")
+        self._mk(link_cwd, "sid-link", age_s=5)
+        got = candidates_for(link_cwd, projects=self.projects)
+        self.assertEqual([c.session_id for c in got], ["sid-link"])
+
+    def test_no_duplicate_candidate_when_both_spellings_resolve(self):
+        """Literal and resolved can encode to two names for one directory; the
+        same conversation must not be offered twice."""
+        from rimagentd.binding import candidates_for
+        self._mk(self.real, "sid-real", age_s=5)
+        self._mk(self.link / "deep" / "tree", "sid-real", age_s=5)
+        got = candidates_for(str(self.link / "deep" / "tree"), projects=self.projects)
+        self.assertEqual(len([c for c in got if c.session_id == "sid-real"]), 1,
+                         "one conversation, one candidate")
+
+
 class TestRebootRecovery(unittest.TestCase):
     """The reboot path, which is the reason this log exists at all.
 
