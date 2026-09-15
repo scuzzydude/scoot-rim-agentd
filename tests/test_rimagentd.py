@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -414,6 +415,61 @@ class TestBinding(unittest.TestCase):
     def test_underscore_and_slash_both_collapse_in_the_directory_name(self):
         from rimagentd.binding import encode_cwd
         self.assertEqual(encode_cwd("/a/b_c/d"), "-a-b-c-d")
+
+
+class TestEventSessionDerivation(unittest.TestCase):
+    """`session` on a defer/escalate is what makes the item returnable later.
+
+    Eleven of the first twelve defer/escalate events in the live log had no session,
+    because every caller had to remember to pass one -- so an item could be parked with
+    no record of who parked it, and nothing could hand it back. The CLI now derives it
+    from $STY. These tests pin all four behaviours, including the two that are easy to
+    break: explicit must win, and a missing raiser must be noisy rather than silent.
+
+    Driven through the CLI as a subprocess, because that is where the derivation lives --
+    deliberately not in EventLog.append(), whose internal callers set `session` to mean
+    the SUBJECT of the event rather than its writer.
+    """
+
+    CLI = str(Path(__file__).resolve().parent.parent / "scoot-rim-agentd")
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.log = str(Path(self.dir.name) / "events.jsonl")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _run(self, args, sty=None):
+        env = dict(os.environ)
+        env.pop("STY", None)
+        if sty:
+            env["STY"] = sty
+        return subprocess.run([sys.executable, self.CLI, "--log", self.log, "event", *args],
+                              capture_output=True, text=True, env=env)
+
+    def test_session_derived_from_sty(self):
+        r = self._run(["defer", "item", "x", "reason", "y"], sty="12345.PTD")
+        self.assertEqual(json.loads(r.stdout)["session"], "PTD")
+
+    def test_explicit_session_beats_sty(self):
+        """A supervisor writing on another session's behalf must not be overwritten."""
+        r = self._run(["defer", "item", "x", "reason", "y", "session", "pat"], sty="12345.PTD")
+        self.assertEqual(json.loads(r.stdout)["session"], "pat")
+
+    def test_missing_raiser_warns(self):
+        r = self._run(["defer", "item", "x", "reason", "y"])
+        self.assertNotIn("session", json.loads(r.stdout))
+        self.assertIn("cannot be handed back", r.stderr)
+
+    def test_non_raiser_event_does_not_warn(self):
+        r = self._run(["release", "resource", "foo"])
+        self.assertNotIn("cannot be handed back", r.stderr)
+
+    def test_sty_without_a_name_is_not_guessed(self):
+        """A malformed $STY must leave session absent rather than invent one."""
+        r = self._run(["defer", "item", "x", "reason", "y"], sty="nodot")
+        self.assertNotIn("session", json.loads(r.stdout))
 
 
 class TestSymlinkedCwd(unittest.TestCase):

@@ -622,6 +622,23 @@ def cmd_event(args) -> int:
               f" it is recorded but will not appear in live/open/claims.",
               file=sys.stderr)
         print(f"  known: {', '.join(KNOWN_EVENTS)}", file=sys.stderr)
+    # Who raised it is what makes an item returnable later: a defer with no session
+    # cannot be handed back to whoever parked it, and the item is stuck until a human
+    # happens to reread the log. Eleven of the first twelve defer/escalate events here
+    # had no session, because every caller has to remember to pass one. Deriving it
+    # from the session backend removes the remembering.
+    #
+    # Explicit always wins -- a supervising agent writing on another session's behalf
+    # passes `session` deliberately, and must not be overwritten by its own $STY.
+    if "session" not in fields:
+        sty = os.environ.get("STY", "")
+        if "." in sty:
+            fields["session"] = sty.split(".", 1)[1]
+    if args.type in ("defer", "escalate") and not fields.get("session"):
+        print(f"scoot-rim-agentd: warning — no 'session' on this {args.type} and $STY is"
+              f" unset, so nothing records who raised it. It cannot be handed back"
+              f" later; pass 'session <name>' explicitly.", file=sys.stderr)
+
     record = _log(args).append(args.type, **fields)
     print(json.dumps(record, ensure_ascii=False))
     return 0
