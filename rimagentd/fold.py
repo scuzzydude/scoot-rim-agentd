@@ -28,6 +28,11 @@ class Session:
     origin: str = ""
     boot_id: str = ""
     started_at: str = ""
+    # Stood down on purpose (players on demand, 2026-11-25): bound and resumable,
+    # but not running and not to be auto-restored. Distinct from "the backend
+    # died", which reconcile closes; a dormant record is held, like a
+    # previous-boot one.
+    dormant: bool = False
 
     @property
     def bound(self) -> bool:
@@ -100,6 +105,7 @@ KNOWN_EVENTS = (
     "defer", "resume",
     "escalate", "decide",
     "reconcile", "restored", "gate_warn",
+    "dormant", "player_up", "player_down",
 )
 
 
@@ -133,6 +139,11 @@ def fold(records: Iterable[dict]) -> State:
                 # adopted session closed before it was ever recorded as started.
                 session = Session(backend_id=bid, name=rec.get("name", ""))
             state.exited[bid] = session
+
+        elif event == "dormant" and bid:
+            session = state.live.get(bid)
+            if session is not None:
+                session.dormant = True
 
         elif event == "cwd_corrected" and bid:
             # A session's recorded position was wrong -- usually its directory

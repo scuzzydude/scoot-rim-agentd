@@ -637,3 +637,77 @@ class TestCwdCorrection(unittest.TestCase):
         self.log.append("session_start", backend_id="1.a", name="a", cwd="/old")
         self.log.append("cwd_corrected", backend_id="1.a")
         self.assertEqual(fold(self.log.records()).live["1.a"].cwd, "/old")
+
+
+class TestPlayersOnDemand(unittest.TestCase):
+    """Players on demand (2026-11-25): after a reboot only captains come back;
+    players stay held, bound and resumable until their captain starts them."""
+
+    CLI = str(Path(__file__).resolve().parent.parent / "scoot-rim-agentd")
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        d = Path(self.dir.name)
+        self.logp = d / "events.jsonl"
+        self.log = EventLog(self.logp)
+        self.cwd = d / "work"; self.cwd.mkdir()
+        self.priv_cwd = d / "private"; self.priv_cwd.mkdir()
+        (d / "roster.toml").write_text(
+            '[[captain]]\nname = "Zeta"\nplayers = ["zplayer"]\n')
+        (d / "private.txt").write_text(f"{self.priv_cwd}\n")
+        self.env = {**os.environ, "SCOOT_RIM_ROSTER": str(d / "roster.toml"),
+                    "SCOOT_RIM_PRIVATE": str(d / "private.txt")}
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, self.CLI, "--log", str(self.logp), *args],
+                              capture_output=True, text=True, env=self.env)
+
+    def start(self, bid, name, cwd, bound=True, boot="an-older-boot"):
+        self.log.append("session_start", backend_id=bid, name=name, cwd=str(cwd), boot_id=boot)
+        if bound:
+            self.log.append("agent_bound", backend_id=bid, agent_session_id=f"id-{name}",
+                            cwd=str(cwd), boot_id=boot)
+
+    def test_dormant_event_marks_and_new_start_clears(self):
+        self.start("1.p", "p", self.cwd, boot=None or "x")
+        self.log.append("dormant", backend_id="1.p")
+        self.assertTrue(fold(self.log.records()).live["1.p"].dormant)
+        self.log.append("session_start", backend_id="1.p", name="p", cwd=str(self.cwd))
+        self.assertFalse(fold(self.log.records()).live["1.p"].dormant)
+
+    def test_only_captains_restores_captains_holds_players_hides_private(self):
+        self.start("901.[Captain]_Zeta", "[Captain]_Zeta", self.cwd)
+        self.start("902.zplayer", "zplayer", self.cwd)
+        self.start("903.secretproj", "secretproj", self.priv_cwd)
+        out = self.cli("restore", "--dry-run", "--only-captains").stdout
+        self.assertIn("WOULD [Captain]_Zeta: claude --resume id-[Captain]_Zeta", out)
+        self.assertIn("HOLD  zplayer — player", out)
+        self.assertNotIn("secretproj", out)          # private: never listed
+
+    def test_unbound_session_is_skipped_alone_not_a_refusal(self):
+        self.start("911.[Captain]_Zeta", "[Captain]_Zeta", self.cwd)
+        self.start("912.loose", "loose", self.cwd, bound=False)
+        r = self.cli("restore", "--dry-run")
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("refusing", r.stdout)
+        self.assertIn("WOULD [Captain]_Zeta", r.stdout)
+        self.assertIn("SKIP  loose — UNBOUND", r.stdout)
+
+    def test_reconcile_holds_a_dormant_record_from_this_boot(self):
+        from rimagentd.events import current_boot_id
+        self.start("921.zplayer", "zplayer", self.cwd, boot=current_boot_id())
+        self.log.append("dormant", backend_id="921.zplayer")
+        self.cli("reconcile", "--quiet")
+        self.assertIn("921.zplayer", fold(self.log.records()).live)
+
+    def test_live_json_reports_state_and_captain(self):
+        self.start("931.zplayer", "zplayer", self.cwd)
+        self.start("932.loose", "loose", self.cwd, bound=False)
+        rows = {r["name"]: r for r in json.loads(self.cli("live", "--json").stdout)}
+        self.assertEqual(rows["zplayer"]["state"], "dormant")
+        self.assertEqual(rows["zplayer"]["captain"], "[Captain]_Zeta")
+        self.assertEqual(rows["loose"]["state"], "broken")
+        self.assertIsNone(rows["loose"]["captain"])
