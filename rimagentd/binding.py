@@ -69,6 +69,33 @@ def encode_cwd(cwd: str) -> str:
     return re.sub(r"[/_]", "-", cwd)
 
 
+def cwd_variants(cwd: str) -> list[str]:
+    """A cwd's distinct spellings, literal first, then symlink-resolved.
+
+    A session launched through a symlinked path has two names for one directory
+    — on this host /srv/bregman is a symlink to /srv/steveai/bregman, so four
+    sessions ran with a cwd under the former while their conversations are filed
+    under the latter. Deriving the project directory from one spelling and
+    looking for the other finds nothing, silently: the session shows up with no
+    conversation bound and nothing reports an error.
+
+    Both spellings are returned rather than picking one. Observed behaviour on
+    this host is that the runtime files under the RESOLVED path, but that is one
+    host's evidence and the wrong thing to bet the lookup on — trying both costs
+    a stat and is correct either way. Literal stays first so a host with no
+    symlinks in play behaves exactly as before.
+    """
+    out = [cwd]
+    if cwd:
+        try:
+            real = os.path.realpath(cwd)
+        except OSError:
+            return out
+        if real and real != cwd:
+            out.append(real)
+    return out
+
+
 def _readlink(path: str) -> str:
     try:
         return os.readlink(path)
@@ -193,13 +220,14 @@ def candidates_for(cwd: str, screen_pid: str = "",
     # raw (pre-strip) readlink values matter: a " (deleted)" suffix carries the
     # ORIGINAL name, which is often exactly the one the conversation is filed
     # under.
-    sources: list[str] = [cwd]
+    sources: list[str] = list(cwd_variants(cwd))
     if screen_pid:
         raw_screen = _readlink(f"/proc/{screen_pid}/cwd")
         _, raw_agent = claude_pid_and_cwd(screen_pid)
         for raw in (raw_screen, raw_agent):
             if raw:
-                sources += [raw, raw.removesuffix(" (deleted)")]
+                for v in (raw, raw.removesuffix(" (deleted)")):
+                    sources += cwd_variants(v)
 
     dirs: list[Path] = []
     for src in sources:
@@ -221,7 +249,7 @@ def candidates_for(cwd: str, screen_pid: str = "",
                 signals.append("sole-transcript")
             elif i == 0:
                 signals.append("newest")
-            if cwd and cwd in transcript_cwds(f):
+            if cwd and any(v in transcript_cwds(f) for v in cwd_variants(cwd)):
                 signals.append("cwd-recorded")
             out.append(Candidate(f.stem, f, st.st_mtime, signals))
 
@@ -231,7 +259,21 @@ def candidates_for(cwd: str, screen_pid: str = "",
         out = _search_by_recorded_cwd(cwd, projects, now)
 
     out.sort(key=lambda c: (c.score, c.mtime), reverse=True)
-    return out
+
+    # One conversation, one candidate. Two spellings of a cwd (§cwd_variants)
+    # can encode to two project-directory names holding the same conversation
+    # id, and offering it twice would corrupt the exclusive assignment
+    # downstream — the rule there is that two sessions must never be offered
+    # the same conversation. Deduped after the sort, so the strongest signal set
+    # for a given id is the one kept.
+    seen: set[str] = set()
+    unique: list[Candidate] = []
+    for c in out:
+        if c.session_id in seen:
+            continue
+        seen.add(c.session_id)
+        unique.append(c)
+    return unique
 
 
 def _search_sibling_dirs(cwd: str, projects: Path, now: float) -> list[Candidate]:
@@ -257,14 +299,14 @@ def _search_sibling_dirs(cwd: str, projects: Path, now: float) -> list[Candidate
         return []
     if len([p for p in parent.split("/") if p]) < MIN_PARENT_DEPTH:
         return []
-    prefix = encode_cwd(parent)
+    prefixes = [encode_cwd(v) for v in cwd_variants(parent)]
     found: list[Candidate] = []
     try:
         entries = list(projects.iterdir())
     except OSError:
         return found
     for d in entries:
-        if not d.is_dir() or not d.name.startswith(prefix):
+        if not d.is_dir() or not any(d.name.startswith(p) for p in prefixes):
             continue
         for f in d.glob("*.jsonl"):
             try:
@@ -308,7 +350,7 @@ def _search_by_recorded_cwd(cwd: str, projects: Path, now: float) -> list[Candid
                 continue
             if now - mtime >= ACTIVE_WINDOW_S:
                 continue
-            if cwd in transcript_cwds(f):
+            if any(v in transcript_cwds(f) for v in cwd_variants(cwd)):
                 found.append(Candidate(f.stem, f, mtime, ["found-by-cwd-scan", "active"]))
     return found
 

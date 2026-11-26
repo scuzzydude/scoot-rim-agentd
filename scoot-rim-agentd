@@ -35,6 +35,66 @@ def _state(args):
     return fold(_log(args).records())
 
 
+# -- players on demand (2026-11-25) -------------------------------------------
+# Brandon: "I want the Captains to spin them up on demand." After a reboot only
+# the captains come back (`restore --only-captains`); players stay held, bound
+# and resumable ("dormant") until their captain runs rim/bin/player-up.
+
+DEFAULT_ROSTER = os.environ.get("SCOOT_RIM_ROSTER", "/srv/steveai/rim/captains_roster.toml")
+DEFAULT_PRIVATE = os.environ.get("SCOOT_RIM_PRIVATE", "/srv/steveai/scripts/ri_flow_exclude.txt")
+
+
+def _roster(path: str = DEFAULT_ROSTER) -> tuple[set[str], dict[str, str]]:
+    """(captain session names, {player name: captain session name})."""
+    import tomllib
+    try:
+        with open(path, "rb") as f:
+            caps = tomllib.load(f).get("captain", [])
+    except FileNotFoundError:
+        return set(), {}
+    names, owner = set(), {}
+    for c in caps:
+        cap = f"[Captain]_{c.get('name', '')}"
+        names.add(cap)
+        for p in c.get("players", []) or []:
+            owner[p] = cap
+    return names, owner
+
+
+def _private(path: str = DEFAULT_PRIVATE) -> tuple[set[str], list[str]]:
+    """Private projects: never auto-restored or listed (names, path prefixes)."""
+    names, prefixes = set(), []
+    try:
+        for line in open(path):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith(("/", "~")):
+                prefixes.append(os.path.realpath(os.path.expanduser(line)).rstrip("/"))
+            else:
+                names.add(line)
+    except FileNotFoundError:
+        pass
+    return names, prefixes
+
+
+def _is_private(s, priv) -> bool:
+    names, prefixes = priv
+    rp = os.path.realpath(s.cwd or "")
+    return s.name in names or any(rp == p or rp.startswith(p + "/") for p in prefixes)
+
+
+def _restore_filter(args, s, captains, priv) -> str:
+    """Why `s` is NOT auto-restored, or "" if it is."""
+    if _is_private(s, priv):
+        return "private"
+    if s.dormant:
+        return "dormant"
+    if getattr(args, "only_captains", False) and s.name not in captains:
+        return "player"
+    return ""
+
+
 # -- commands ---------------------------------------------------------------
 
 def cmd_live(args) -> int:
@@ -43,7 +103,18 @@ def cmd_live(args) -> int:
         print("no live sessions in the log")
         return 0
     if args.json:
-        print(json.dumps([s.__dict__ for s in state.sessions_sorted()], indent=2))
+        # state: running | dormant (bound, not running) | broken (no id).
+        # captain: the owning captain from the roster (null for captains/unknown).
+        alive = _live_backend_names() or set()
+        _, owner = _roster()
+        out = []
+        for s in state.sessions_sorted():
+            d = dict(s.__dict__)
+            d["state"] = ("running" if s.backend_id in alive
+                          else "dormant" if s.bound else "broken")
+            d["captain"] = owner.get(s.name)
+            out.append(d)
+        print(json.dumps(out, indent=2))
         return 0
     width = max(len(s.name) for s in state.live.values()) if state.live else 4
     for s in state.sessions_sorted():
@@ -173,7 +244,15 @@ def cmd_restore_plan(args) -> int:
     if not state.live:
         print("# nothing to restore")
         return 0
+    captains, _ = _roster()
+    priv = _private()
     for s in state.sessions_sorted():
+        why = _restore_filter(args, s, captains, priv)
+        if why == "private":
+            continue                      # never listed
+        if why:
+            print(f"# HOLD {s.name} — {why}; started on demand (rim/bin/player-up)")
+            continue
         if not s.cwd:
             print(f"# SKIP {s.name} — no cwd recorded")
             continue
@@ -181,10 +260,10 @@ def cmd_restore_plan(args) -> int:
             print(f"# SKIP {s.name} — cwd no longer exists: {s.cwd}")
             continue
         if s.bound:
-            inner = f"claude --resume {s.agent_session_id}"
+            inner = f"claude --name {shlex.quote(s.name)} --resume {s.agent_session_id}"
         else:
             print(f"# {s.name} — no agent_session_id; resume-by-directory is APPROXIMATE")
-            inner = "claude --continue"
+            inner = f"claude --name {shlex.quote(s.name)} --continue"
         print(
             f"(cd {shlex.quote(s.cwd)} && screen -dmS {shlex.quote(s.name)} && "
             f"screen -S {shlex.quote(s.name)} -X stuff {shlex.quote(inner + chr(13))})"
@@ -211,14 +290,12 @@ def cmd_restore(args) -> int:
         print("nothing to restore")
         return 0
 
-    unbound = [s for s in state.sessions_sorted() if not s.bound]
-    if unbound and not args.allow_approximate:
-        print("refusing to restore: these sessions have no agent_session_id, so")
-        print("resuming them would attach to the wrong conversation or a blank one:")
-        for s in unbound:
-            print(f"  {s.name} ({s.backend_id})")
-        print("\nfix: run 'scoot-rim register' inside each, or pass --allow-approximate")
-        return 1
+    # Per session (2026-11-25): one unbound session used to block EVERY restore.
+    # Now it is skipped and reported, and the rest still come back. Resuming it
+    # by directory would attach to the wrong conversation or a blank one, so it
+    # stays skipped unless --allow-approximate.
+    captains, _ = _roster()
+    priv = _private()
 
     import subprocess
 
@@ -233,8 +310,15 @@ def cmd_restore(args) -> int:
         print("restore: 'screen' not found — cannot restore", file=sys.stderr)
         return 2
 
-    restored = skipped = 0
+    restored = skipped = held = 0
+    unbound_skipped = []
     for s in state.sessions_sorted():
+        why = _restore_filter(args, s, captains, priv)
+        if why:
+            if why != "private":          # private projects are never listed
+                print(f"HOLD  {s.name} — {why}; resumable on demand (rim/bin/player-up)")
+            held += 1
+            continue
         if not s.cwd or not Path(s.cwd).is_dir():
             print(f"SKIP  {s.name} — cwd missing: {s.cwd or '<none>'}")
             skipped += 1
@@ -244,10 +328,17 @@ def cmd_restore(args) -> int:
             skipped += 1
             continue
         if not s.bound and not args.allow_approximate:
+            print(f"SKIP  {s.name} — UNBOUND (no agent_session_id); fix its binding, "
+                  f"or pass --allow-approximate")
+            unbound_skipped.append(s.name)
             skipped += 1
             continue
 
-        inner = (f"claude --resume {s.agent_session_id}" if s.bound else "claude --continue")
+        # --name as captain-launch.sh does: without it Claude names the resumed
+        # session after its directory, and peers (ListAgents, player-up) see
+        # "Bridge", not "[Captain]_Bridge". Seen on the 11-25 reboot.
+        inner = (f"claude --name {shlex.quote(s.name)} "
+                 + (f"--resume {s.agent_session_id}" if s.bound else "--continue"))
         if args.dry_run:
             print(f"WOULD {s.name}: {inner}  (cwd {s.cwd})")
             continue
@@ -304,7 +395,9 @@ def cmd_restore(args) -> int:
         print(f"RESTORED {s.name}  ({'resume' if s.bound else 'APPROXIMATE'})")
         restored += 1
 
-    print(f"\n{restored} restored, {skipped} skipped")
+    print(f"\n{restored} restored, {skipped} skipped, {held} held (dormant/players/private)")
+    if unbound_skipped:
+        print(f"{len(unbound_skipped)} skipped as UNBOUND: " + ", ".join(unbound_skipped))
     return 0
 
 
@@ -349,6 +442,10 @@ def cmd_reconcile(args) -> int:
         # it. Closing it here would destroy the recovery set, and this timer runs
         # at boot (Persistent=true), so it would do so before anything could
         # restore. Verified: it emptied all twelve in one pass.
+        # Stood down on purpose (rim/bin/player-down): bound, resumable, held.
+        if s.dormant:
+            held += 1
+            continue
         if s.from_previous_boot and not args.close_previous_boot:
             if not args.quiet:
                 print(f"held  {s.name} — was running before the last reboot; "
@@ -622,6 +719,23 @@ def cmd_event(args) -> int:
               f" it is recorded but will not appear in live/open/claims.",
               file=sys.stderr)
         print(f"  known: {', '.join(KNOWN_EVENTS)}", file=sys.stderr)
+    # Who raised it is what makes an item returnable later: a defer with no session
+    # cannot be handed back to whoever parked it, and the item is stuck until a human
+    # happens to reread the log. Eleven of the first twelve defer/escalate events here
+    # had no session, because every caller has to remember to pass one. Deriving it
+    # from the session backend removes the remembering.
+    #
+    # Explicit always wins -- a supervising agent writing on another session's behalf
+    # passes `session` deliberately, and must not be overwritten by its own $STY.
+    if "session" not in fields:
+        sty = os.environ.get("STY", "")
+        if "." in sty:
+            fields["session"] = sty.split(".", 1)[1]
+    if args.type in ("defer", "escalate") and not fields.get("session"):
+        print(f"scoot-rim-agentd: warning — no 'session' on this {args.type} and $STY is"
+              f" unset, so nothing records who raised it. It cannot be handed back"
+              f" later; pass 'session <name>' explicitly.", file=sys.stderr)
+
     record = _log(args).append(args.type, **fields)
     print(json.dumps(record, ensure_ascii=False))
     return 0
@@ -656,10 +770,14 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("open", help="deferred/escalated with no resume/decide").set_defaults(func=cmd_open)
     sub.add_parser("claims", help="outstanding resource claims").set_defaults(func=cmd_claims)
-    sub.add_parser("restore-plan", help="what a restore would run (prints only)").set_defaults(func=cmd_restore_plan)
+    p = sub.add_parser("restore-plan", help="what a restore would run (prints only)")
+    p.add_argument("--only-captains", action="store_true")
+    p.set_defaults(func=cmd_restore_plan)
 
     p = sub.add_parser("restore", help="re-create live sessions (guarded)")
     p.add_argument("--dry-run", action="store_true", help="show what would run")
+    p.add_argument("--only-captains", action="store_true",
+                   help="restore only [Captain]_* sessions named in the roster; hold players as dormant")
     p.add_argument("--allow-approximate", action="store_true",
                    help="also restore sessions with no agent_session_id (may resume the WRONG conversation)")
     p.set_defaults(func=cmd_restore)
