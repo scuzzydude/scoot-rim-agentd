@@ -683,7 +683,7 @@ class TestPlayersOnDemand(unittest.TestCase):
         self.start("902.zplayer", "zplayer", self.cwd)
         self.start("903.secretproj", "secretproj", self.priv_cwd)
         out = self.cli("restore", "--dry-run", "--only-captains").stdout
-        self.assertIn("WOULD [Captain]_Zeta: claude --resume id-[Captain]_Zeta", out)
+        self.assertIn("WOULD [Captain]_Zeta: claude --name '[Captain]_Zeta' --resume id-[Captain]_Zeta", out)
         self.assertIn("HOLD  zplayer — player", out)
         self.assertNotIn("secretproj", out)          # private: never listed
 

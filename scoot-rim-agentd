@@ -260,10 +260,10 @@ def cmd_restore_plan(args) -> int:
             print(f"# SKIP {s.name} — cwd no longer exists: {s.cwd}")
             continue
         if s.bound:
-            inner = f"claude --resume {s.agent_session_id}"
+            inner = f"claude --name {shlex.quote(s.name)} --resume {s.agent_session_id}"
         else:
             print(f"# {s.name} — no agent_session_id; resume-by-directory is APPROXIMATE")
-            inner = "claude --continue"
+            inner = f"claude --name {shlex.quote(s.name)} --continue"
         print(
             f"(cd {shlex.quote(s.cwd)} && screen -dmS {shlex.quote(s.name)} && "
             f"screen -S {shlex.quote(s.name)} -X stuff {shlex.quote(inner + chr(13))})"
@@ -334,7 +334,11 @@ def cmd_restore(args) -> int:
             skipped += 1
             continue
 
-        inner = (f"claude --resume {s.agent_session_id}" if s.bound else "claude --continue")
+        # --name as captain-launch.sh does: without it Claude names the resumed
+        # session after its directory, and peers (ListAgents, player-up) see
+        # "Bridge", not "[Captain]_Bridge". Seen on the 11-25 reboot.
+        inner = (f"claude --name {shlex.quote(s.name)} "
+                 + (f"--resume {s.agent_session_id}" if s.bound else "--continue"))
         if args.dry_run:
             print(f"WOULD {s.name}: {inner}  (cwd {s.cwd})")
             continue
